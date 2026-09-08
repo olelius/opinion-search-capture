@@ -1,0 +1,35 @@
+# 仅本地保留的协作规则和运行问题库
+/AGENTS.md
+/RUNTIME_ISSUES.md
+
+# 截图仅本地保留；docs 下其他类型文档仍可同步
+/docs/**/*.jpg
+/docs/**/*.jpeg
+/docs/**/*.png
+/docs/**/*.webp
+
+# 本地环境配置（保留无敏感信息的示例）
+.env
+.env.*
+!.env.example
+
+# Python 环境与缓存
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 前端依赖及构建产物
+node_modules/
+dist/
+build/
+
+# 日志和系统临时文件
+*.log
+.DS_Store
+Thumbs.db
