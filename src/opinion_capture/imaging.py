@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
-from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageStat
+from PIL import Image, ImageChops, ImageStat
 
 from .exporting import export_path, path_identity, publish_immutable
 
@@ -142,31 +142,6 @@ def compose_grid(image_paths: Iterable[str | Path], output_path: str | Path,
     return dict(result, inputs=[str(p) for p in paths], columns=cols, placements=placements)
 
 
-def _label_font(cell_width: int):
-    """优先复用系统中文字体；无中文字体时仍保留英文状态和清单原文。"""
-    size = min(24, max(8, cell_width // 12))
-    candidates = [Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts/msyh.ttc",
-                  Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-                  Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")]
-    for candidate in candidates:
-        if candidate.is_file():
-            return ImageFont.truetype(str(candidate), size=size)
-    return ImageFont.load_default()
-
-
-def _label_lines(text: str, font, width: int) -> list[str]:
-    """按字形宽度换行，不用截断省略来隐藏关键词或失败标记。"""
-    lines, line = [], ""
-    for char in text.replace("\r", " ").replace("\n", " "):
-        if font.getlength(char) > width:
-            raise ImagingError("单元宽度过小，容纳不了标签字形")
-        if line and font.getlength(line + char) > width:
-            lines.append(line)
-            line = ""
-        line += char
-    return [*lines, line] if line else lines
-
-
 def compose_pages(image_paths: Iterable[str | Path | None], output_dir: str | Path, *,
                   members: Iterable[Mapping] | None = None, layout: str = "grid",
                   columns: int = 4, cell_width: int = 1080, gap: int = 16,
@@ -176,8 +151,8 @@ def compose_pages(image_paths: Iterable[str | Path | None], output_dir: str | Pa
                   output_path_factory: Callable[[int], str | Path] | None = None) -> dict:
     """按冻结顺序输出完整单元的多页汇总，页号从 1 起，全局 index 从 0 起。
 
-    image_paths 与 members 一一对应；None 或 failed/blocked 等状态绘制明确
-    占位卡，不把受阻截图当成功内容。partial 图片正常保留并加状态标签。
+    image_paths 与 members 一一对应；只排版有效图片，不添加标题、状态条或
+    文字占位卡。缺图/失败状态保存在members和omitted_members，不冒充成功内容。
     所有图片只等比例缩小、不放大小图、不裁切；若单元独占一页仍超限，
     抛 ImagingError，调用方应明确调整宽度/预算，而非横切文字或猜拼。
     output_path_factory(part) 优先于文件模板；所有目标先检查再写，路径须在
@@ -194,32 +169,33 @@ def compose_pages(image_paths: Iterable[str | Path | None], output_dir: str | Pa
     if isinstance(image_paths, (str, Path)):
         raise ImagingError("image_paths 应为路径清单")
     raw_paths = list(image_paths)
-    annotated = members is not None
-    metadata = [dict(m) for m in members] if annotated else [{} for _ in raw_paths]
+    metadata = [dict(m) for m in members] if members is not None else [{} for _ in raw_paths]
     if not raw_paths or len(metadata) != len(raw_paths):
         raise ImagingError("图片清单应非空且与 members 一一对应，缺图请传 None")
     root = Path(output_dir).resolve()
-    font = _label_font(cell_width)
-    padding = min(12, cell_width // 6)
-    line_height = font.getbbox("Ag国")[3] - min(0, font.getbbox("Ag国")[1]) + 6
-    units = []
+    units, omitted = [], []
     for index, (raw, member) in enumerate(zip(raw_paths, metadata)):
         status = str(member.get("status", "success" if raw is not None else "missing"))
         path = Path(raw).resolve(strict=True) if raw is not None and status in ("success", "partial") else None
         if path is None and status in ("success", "partial"):
             status = "missing"
-        size = _size(path, max_input_pixels) if path else None
-        scaled = ((min(cell_width, size[0]), max(1, round(size[1] * min(cell_width, size[0]) / size[0])))
-                  if size else (cell_width, 0))
-        label = f"#{index + 1} {member.get('keyword', '')} [{status.upper()}]"
         if path is None:
-            label += " NO IMAGE / 缺少有效截图"
-        lines = _label_lines(label, font, cell_width - padding * 2) if annotated or path is None or status != "success" else []
-        header = len(lines) * line_height + padding * 2 if lines else 0
+            omitted.append({"index": index, "order": index + 1, "keyword": member.get("keyword"),
+                            "status": status, "member": member, "reason": "no_usable_image"})
+            continue
+        size = _size(path, max_input_pixels)
+        scaled = (min(cell_width, size[0]), max(1, round(size[1] * min(cell_width, size[0]) / size[0])))
         units.append({"index": index, "order": index + 1, "path": str(path) if path else None,
                       "keyword": member.get("keyword"), "status": status, "member": member,
                       "source_size": list(size) if size else None, "size": scaled,
-                      "lines": lines, "header": header, "card_height": header + scaled[1]})
+                      "card_height": scaled[1]})
+
+    if not units:
+        return {"pages": [], "page_count": 0, "members": metadata, "omitted_members": omitted,
+                "status": "partial", "reason": "no_usable_images", "layout": layout,
+                "cell_width": cell_width, "order": list(range(len(raw_paths))),
+                "rendered_order": [], "added_annotations": False,
+                "boundaries": ["没有有效图片时不生成文字占位图，缺失信息仅保存在清单。"]}
 
     def dimensions(rows):
         """把行结构换算为实际画布，空列不占据最终输出宽度。"""
@@ -290,40 +266,38 @@ def compose_pages(image_paths: Iterable[str | Path | None], output_dir: str | Pa
             width, height = dimensions(page_rows)
             placements = []
             with Image.new("RGB", (width, height), "white") as canvas:
-                draw = ImageDraw.Draw(canvas)
                 y = gap
                 for row_number, row in enumerate(page_rows):
                     for col, unit in enumerate(row):
                         x = gap + col * (cell_width + gap)
-                        if unit["lines"]:
-                            color = "#fff0e9" if unit["status"] != "success" else "#eef3f7"
-                            draw.rectangle((x, y, x + cell_width - 1, y + unit["header"] - 1), fill=color)
-                            for line_index, line in enumerate(unit["lines"]):
-                                draw.text((x + padding, y + padding + line_index * line_height), line,
-                                          fill="#8a2300" if unit["status"] != "success" else "#243447", font=font)
-                        image_y = y + unit["header"]
+                        image_y = y
                         if unit["path"]:
                             with _read(Path(unit["path"])) as source:
                                 if list(source.size) != unit["source_size"]:
                                     raise ImagingError("输入尺寸在排版后变化，请冻结原图后重试")
-                                with source.resize(unit["size"], Image.Resampling.LANCZOS) as resized:
-                                    canvas.paste(resized, (x, image_y))
+                                if source.size == unit["size"]:
+                                    canvas.paste(source, (x, image_y))
+                                else:
+                                    with source.resize(unit["size"], Image.Resampling.LANCZOS) as resized:
+                                        canvas.paste(resized, (x, image_y))
                         placements.append({k: unit[k] for k in ("index", "order", "path", "keyword", "status", "member", "source_size")}
                                           | {"page": part, "part": part, "row": row_number, "column": col,
                                              "x": x, "y": image_y, "width": unit["size"][0], "height": unit["size"][1],
                                              "card_box": [x, y, x + cell_width, y + unit["card_height"]],
-                                             "label_box": [x, y, x + cell_width, image_y], "placeholder": unit["path"] is None})
+                                             "label_box": None, "placeholder": False})
                     y += max(u["card_height"] for u in row) + gap
                 result = _save(canvas, output)
             pages.append(result | {"page": part, "part": part, "page_count": len(outputs),
                                    "columns": max(len(row) for row in page_rows), "placements": placements,
                                    "members": [p["member"] for p in placements], "order": [p["index"] for p in placements],
-                                   "inputs": [p["path"] for p in placements if p["path"]]})
+                                   "inputs": [p["path"] for p in placements if p["path"]],
+                                   "omitted_members": omitted, "added_annotations": False})
         except Exception as exc:
             raise PageCompositionError(str(exc), pages, part, len(outputs)) from exc
-    return {"pages": pages, "page_count": len(pages), "members": metadata,
-            "status": "success" if all(u["status"] == "success" for u in units) else "partial",
-            "layout": layout, "cell_width": cell_width, "order": list(range(len(units))),
+    return {"pages": pages, "page_count": len(pages), "members": metadata, "omitted_members": omitted,
+            "status": "success" if not omitted and all(u["status"] == "success" for u in units) else "partial",
+            "layout": layout, "cell_width": cell_width, "order": list(range(len(raw_paths))),
+            "rendered_order": [u["index"] for u in units], "added_annotations": False,
             "boundaries": ["整图分页，不横切文字；单元自身超限需显式调整预算。", "逐页排他发布，不承诺多文件事务。"]}
 
 

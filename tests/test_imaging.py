@@ -215,23 +215,28 @@ class ImagingTests(unittest.TestCase):
         result = compose_pages([p, None, p, p], self.root / "states", members=members,
                                cell_width=300, columns=2, max_height=1000)
         items = [p for page in result["pages"] for p in page["placements"]]
-        self.assertEqual([p["keyword"] for p in items], ["A1", "A10", "a1", "A/1"])
-        self.assertEqual([p["placeholder"] for p in items], [False, True, False, True])
+        self.assertEqual([p["keyword"] for p in items], ["A1", "a1"])
+        self.assertEqual([p["index"] for p in items], [0, 2])
+        self.assertEqual([p["keyword"] for p in result["omitted_members"]], ["A10", "A/1"])
+        self.assertTrue(all(not p["placeholder"] and p["label_box"] is None for p in items))
         self.assertEqual(result["status"], "partial")
         self.assertEqual(members, frozen)
         with Image.open(result["pages"][0]["path"]) as im:
             item = items[0]
-            self.assertGreater(item["y"], item["card_box"][1])
+            self.assertEqual(item["y"], item["card_box"][1])
             self.assertEqual((item["width"], item["height"]), (300, 100))
             self.assertEqual(im.crop((item["x"], item["y"], item["x"] + 300, item["y"] + 100)).getextrema(),
                              ((0, 0), (0, 0), (255, 255)))
 
-    def test_all_failed_and_long_keyword_labels(self):
+    def test_all_failed_metadata_without_placeholder_images(self):
         result = compose_pages([None, None], self.root / "missing", members=[
             {"keyword": "长关键词" * 20, "status": "failed"}, {"keyword": "A10", "status": "blocked"}],
             cell_width=180, columns=1, max_height=2000)
         self.assertEqual(result["status"], "partial")
-        self.assertTrue(all(p["placeholder"] for page in result["pages"] for p in page["placements"]))
+        self.assertEqual(result["pages"], [])
+        self.assertEqual(result["page_count"], 0)
+        self.assertEqual(len(result["omitted_members"]), 2)
+        self.assertFalse((self.root / "missing").exists())
         self.assertEqual(len(result["members"]), 2)
 
     def test_single_cell_over_limit_fails_before_writing_not_sliced(self):

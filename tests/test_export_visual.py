@@ -53,7 +53,7 @@ class ExportVisualTests(unittest.TestCase):
                             with source.convert("RGB") as rgb, rgb.resize((w, h), Image.Resampling.LANCZOS) as expected:
                                 with canvas.crop((x, y, x + w, y + h)) as actual, ImageChops.difference(expected, actual) as diff:
                                     self.assertIsNone(diff.getbbox(), "派生图片发生遮挡或非预期裁切")
-                    self.assertGreaterEqual(min(p["y"] - p["card_box"][1] for p in page["placements"]), 1)
+                    self.assertTrue(all(p["y"] == p["card_box"][1] and p["label_box"] is None for p in page["placements"]))
             after = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
             self.assertEqual(before, after)
             report["groups"].append({"name": name, "source_count": count, "source_hashes": before, "result": result})

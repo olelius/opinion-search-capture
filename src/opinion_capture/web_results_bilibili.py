@@ -18,7 +18,7 @@ RANK_POLICY = {
     "excluded": ["账号聚合及其内嵌视频", "相关搜索", "直播", "课堂课程合集", "非视频模块"],
     "order": "页码递增，每页可见独立卡DOM顺序；相同稳定身份只计首次出现",
     "boundary": "完整宽度自页顶截至目标卡底部；邻卡保留，另记完整/局部有效rank范围",
-    "composition": "原图不可覆盖；逐页矩形裁切后纵向拼接，页间仅添加明确的证据说明栏",
+    "composition": "原图不可覆盖；逐页原像素矩形裁切后直接纵向拼接，证据说明只保存在JSON",
 }
 
 # 不写样式、不隐藏节点。屏幕外的 unobscured 为 null，必须滚动到现场检查。
@@ -336,27 +336,19 @@ def png_details(path: Path, expected_size: tuple[int, int] | None = None) -> dic
 
 
 def compose_primary(pages: list[dict], destination: Path, top_n: int, check) -> dict:
-    """逐页原像素裁切拼接，说明栏与网页像素分离；复核逐块相等和原图哈希。"""
-    from PIL import Image, ImageDraw, ImageFont
+    """逐页原像素裁切后直接拼接；不添加标题/色条，证据说明仅存于元数据。"""
+    from PIL import Image
     check()
-    width = max(page["crop"]["box"][2] for page in pages)
-    height = sum(page["crop"]["box"][3] + 56 for page in pages)
+    width = max(page["crop"]["box"][2] - page["crop"]["box"][0] for page in pages)
+    height = sum(page["crop"]["box"][3] - page["crop"]["box"][1] for page in pages)
     if width * height > 80_000_000:
         raise ValueError("primary_pixel_budget_exceeded:80000000")
     canvas = Image.new("RGB", (width, height), "white")
-    font = ImageFont.load_default()
     y = 0
     segments = []
     for page in pages:
         check()
         crop = page["crop"]
-        promoted = [i['rank'] for i in page['occurrences'] if i.get('promoted') and i.get('rank') in crop['fully_visible_ranks']]
-        label = f"SOURCE PAGE {page['page_index']} | requested TOP {top_n} | full ranks {crop['effective_rank_range']} | extra {crop['incidental_ranks']} | partial {crop['partially_visible_ranks']} | promoted {promoted}"
-        draw = ImageDraw.Draw(canvas)
-        draw.rectangle((0, y, width, y + 55), fill="#e8eef4")
-        draw.text((12, y + 10), label, fill="#172433", font=font)
-        draw.text((12, y + 30), "Original page pixels below; neighbor cards retained. Global ranks follow first occurrence.", fill="#172433", font=font)
-        y += 56
         with Image.open(page["source"]["path"]) as original:
             region = original.convert("RGB").crop(crop["box"])
             canvas.paste(region, (0, y))
@@ -376,7 +368,8 @@ def compose_primary(pages: list[dict], destination: Path, top_n: int, check) -> 
                 raise ValueError("derived_pixels_mismatch")
             if hashlib.sha256(Path(segment["source_path"]).read_bytes()).hexdigest() != page["source"]["sha256"]:
                 raise ValueError("source_changed_after_capture")
-    return {**details, "segments": segments, "pixel_integrity_verified": True}
+    return {**details, "segments": segments, "requested_top_n": top_n,
+            "pixel_integrity_verified": True, "added_annotations": False}
 
 
 def assess_results(request: dict, scene: dict, *, screenshot_saved: bool, dom_stable: bool) -> dict:
