@@ -1,0 +1,8 @@
+# 本轮实际运行的直接依赖组合；测试环境复用了宿主已有只读依赖。
+Pillow==10.2.0
+playwright==1.48.0
+uiautomator2==3.7.0
+adbutils==2.12.0
+APScheduler==3.11.3
+PySide6==6.7.1
+tzdata==2024.1

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "plan": {
+    "name": "便携示例计划",
+    "project": "示例项目",
+    "keywords": ["示例关键词"],
+    "platforms": ["bilibili", "xiaohongshu"],
+    "clients": ["APP", "WEB"],
+    "capture_kinds": ["results", "suggestions"],
+    "top_n": 20
+  }
+}

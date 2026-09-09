@@ -21,6 +21,9 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.local/
+.capture-state/
+*.egg-info/
 .coverage
 htmlcov/
 
