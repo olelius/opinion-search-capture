@@ -97,6 +97,7 @@ class FakePage:
         if self.platform == "xhs":
             identity = str(self.generation + 1) * 24
             return dict(url=self.url, keyword=self.keyword, input_id="search-input", input_visible=True,
+                        search_tab="综合",
                         login_modal=self.blocked, loading=False, pending_images=0,
                         scroll=dict(top=self.top, at_top=self.top == 0, viewport_height=100, height=400),
                         document=dict(scroll_y=self.top), viewport=dict(width=100, height=100),

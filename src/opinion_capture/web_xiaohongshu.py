@@ -310,6 +310,36 @@ def _dedicated_profile(profile: Path):
         lock.close()
 
 
+def _observe_native_search(page) -> None:
+    """只观察页面自己发出的笔记搜索及对应响应；每页只保留最新请求的排序上下文。"""
+    if isinstance(getattr(page, "_opinion_search_state", None), dict) or not hasattr(page, "on"):
+        return
+    tracking = {}
+    def requested(request):
+        try:
+            parsed = urlparse(request.url)
+            if (parsed.scheme != "https" or not (parsed.hostname or "").endswith(".xiaohongshu.com")
+                    or not parsed.path.endswith("/search/notes")):
+                return
+            data = request.post_data_json
+            if not isinstance(data, dict) or not isinstance(data.get("keyword"), str) or not isinstance(data.get("sort"), str):
+                return
+            sequence = tracking.get("sequence", 0) + 1
+            tracking.update(request=request, sequence=sequence, value=dict(keyword=data["keyword"], sort=data["sort"],
+                note_type=data.get("note_type"), request_path=parsed.path, response_status=None, sequence=sequence))
+        except Exception:
+            pass
+    def responded(response):
+        try:
+            if tracking.get("request") == response.request:
+                tracking["value"]["response_status"] = response.status
+        except Exception:
+            pass
+    page.on("request", requested)
+    page.on("response", responded)
+    page._opinion_search_state = tracking
+
+
 def _snapshot(page, budget: Budget, http_status=None) -> dict:
     """跳转替换文档时短等后重读；不重复导航，驱动卡死仍受外层总预算约束。"""
     for attempt in range(4):
@@ -324,6 +354,15 @@ def _snapshot(page, budget: Budget, http_status=None) -> dict:
             budget.pause(100)
             continue
         state["http_status"] = http_status
+        tracking = getattr(page, "_opinion_search_state", None)
+        observed = tracking.get("value") if isinstance(tracking, dict) else None
+        if observed and observed["keyword"] == state.get("keyword") and _normal_search_matches(state, observed["keyword"]):
+            state["search_sort_evidence"] = dict(observed, source="native_search_request")
+            if observed["response_status"] == 200:
+                if observed["sort"] == "general" and observed["note_type"] == 0:
+                    state["search_tab"] = "综合"
+                else:
+                    state["search_tab"] = "非综合默认范围"
         budget.check()
         return state
 
@@ -332,6 +371,8 @@ def _settled(page, request: dict, budget: Budget, http_status=None) -> dict:
     """等待本次页面的 DOM 和可见图片稳定；不导航重试、不再次提交搜索。"""
     phase("waiting_content", "等待目标内容与图片稳定")
     previous = None
+    previous_ids = request.get("_previous_result_ids")
+    saw_empty_or_loading = False
     until = min(budget.deadline, time.monotonic() + 12)
     while True:
         state = _snapshot(page, budget, http_status)
@@ -340,6 +381,15 @@ def _settled(page, request: dict, budget: Budget, http_status=None) -> dict:
         present = bool(state.get(request["capture_kind"])) or (request["capture_kind"] == "results" and state.get("explicit_end"))
         pending = state.get("suggestion_pending_images", 0) if request["capture_kind"] == "suggestions" else state.get("pending_images")
         bound = not _source_problem(state, request, require_input_visibility=request["capture_kind"] == "suggestions")
+        if request["capture_kind"] == "results" and state.get("search_sort_evidence") and state["search_sort_evidence"]["response_status"] != 200:
+            bound = False
+        if request["capture_kind"] == "results" and previous_ids is not None:
+            saw_empty_or_loading = saw_empty_or_loading or not state.get("results") or bool(state.get("loading"))
+            current_ids = [item.get("id") for item in state.get("results", [])]
+            observed = state.get("search_sort_evidence", {})
+            refreshed = (observed.get("response_status") == 200
+                         and observed.get("sequence", 0) > request.get("_previous_search_sequence", 0))
+            bound = bound and (saw_empty_or_loading or current_ids != previous_ids or refreshed)
         if request["capture_kind"] == "suggestions" and request.get("fresh_search"):
             normalize = lambda value: "".join(unicodedata.normalize("NFKC", value).casefold().split())
             bound = (bound and state.get("suggestion_panel_associated") and state.get("suggestion_panel_rect")
@@ -449,6 +499,16 @@ def _next_scroll_step(state: dict, analysis: dict, top_n: int) -> float:
     if pending and pending.issubset(current):
         rect = scroll.get("rect", [0, 0, 0, visible_height])
         bottom = min(state.get("viewport", {}).get("height", rect[1]+rect[3]), rect[1]+rect[3])
+        # C11旧现场：首帧底部卡片尚无有效覆盖，直接滚80%会把其顶部送进固定栏。
+        # 仅对这类未覆盖、底部跨屏且可完整放入视口的目标先居中，不滚过缺口再空等。
+        for key in pending:
+            item = current[key]
+            _, top, _, height = item["rect"]
+            if (item.get("coverage") is None and rect[1] <= top < bottom < top + height
+                    and 0 < height < visible_height):
+                center_step = top - (rect[1] + (visible_height - height) / 2)
+                if center_step > 0:
+                    step = min(step, center_step)
         missing = max(current[key]["rect"][1]+current[key]["rect"][3] for key in pending)-bottom
         if missing <= 0:
             return 0  # 已在画面内，先等图片/遮挡状态，不滚走缺失内容。
@@ -516,13 +576,17 @@ def _collect(page, request: dict, run: Path, result: dict, evidence: dict, budge
                        (request["capture_kind"] == "results" and frame["after"].get("explicit_end")) for frame in frames)
     sources_bound = all(not _source_problem(frame["after"], request, require_input_visibility=index == 0)
                         for index, frame in enumerate(frames))
-    if frames and target_scene and sources_bound and result["status"] in ("success", "partial"):
+    verified_result = request["capture_kind"] != "results" or (result["status"] == "success" and result.get("rank_verified") is True)
+    if frames and target_scene and sources_bound and result["status"] in ("success", "partial") and verified_result:
         path, layout, digest = _compose_primary(frames, run, budget, result if request["capture_kind"] == "results" else None)
         result["primary_artifact_path"] = path
         result["artifact_paths"].append(path)
         evidence.update(primary_sha256=digest, primary_layout=layout,
                         composition="continuous_native_scroll_column" if request["capture_kind"] == "results" and result.get("rank_verified") else "native_viewport_frames",
                         contains_context_beyond_top_n=True)
+    elif request["capture_kind"] == "results":
+        result["primary_artifact_path"] = None
+        evidence["diagnostic_only_reason"] = "result_coverage_not_verified"
     evidence["artifact_role"] = "target_observation" if result["primary_artifact_path"] else "diagnostic"
     _checkpoint(run, result, evidence)
 
@@ -545,8 +609,9 @@ def _worker(request: dict, run: Path, result: dict, *, mode: str = "capture", de
                 locale="zh-CN", timezone_id="Asia/Shanghai", device_scale_factor=1, timeout=budget.check())
             try:
                 page = context.pages[0] if context.pages else context.new_page()
-                # 登录保留首页；实际采集统一用户指定的普通搜索入口，避免首页跳入AI布局。
-                url = "https://www.xiaohongshu.com/explore" if mode == "login" else _normal_search_url(request["keyword"])
+                # 冷启动建立首页上下文；采集随后直接进入普通结果，不点击首页AI搜索按钮。
+                url = ("https://www.xiaohongshu.com/explore" if mode == "login" or request["capture_kind"] == "results"
+                       else _normal_search_url(request["keyword"]))
                 evidence.update(requested_url=url, navigation_attempts=1, browser=str(candidates[0]))
                 _checkpoint(run, result, evidence)
                 response = page.goto(url, wait_until="domcontentloaded", timeout=budget.check(30_000))
@@ -828,7 +893,8 @@ def _input_control(page, state):
 
 def _normal_search_url(keyword: str) -> str:
     """统一普通搜索入口，沿用已验证的原生双重编码；不修改页面CSS或结果卡布局。"""
-    return "https://www.xiaohongshu.com/search_result?" + urlencode({
+    # 采用真实301链最终200地址的HTTPS尾斜杠形式，省去HTTP中转。
+    return "https://www.xiaohongshu.com/search_result/?" + urlencode({
         "keyword": quote(keyword, safe=""), "source": "web_explore_feed"})
 
 
@@ -842,26 +908,78 @@ def _normal_search_matches(state: dict, keyword: str) -> bool:
             and state.get("input_id") not in ("search-input-ai", "search-input-in-feeds"))
 
 
-def _prepare_current_page(page, request: dict, evidence: dict, budget: Budget, page_ref=None) -> dict:
-    """普通同词页零导航，首轮/切词/重试最多一次普通搜索导航，不经AI入口。"""
-    phase("prepare_search", "定位搜索框与当前关键词")
-    state = _snapshot(page, budget)
-    evidence["initial_snapshot"] = state
-    fresh = request.get("fresh_search", False)
-    search_url = _normal_search_url(request["keyword"])
-    if state.get("url") == "about:blank":
-        # 连接层只会为缺失的平台新建空标签页；一次进入目标页，不另开浏览器。
-        url = search_url
-        evidence.update(navigation_attempts=1, requested_url=url)
-        response = page.goto(url, wait_until="domcontentloaded", timeout=budget.check(30_000))
-        budget.check()
-        evidence["http_status"] = response.status if response else None
+def _ordinary_surface(state: dict) -> bool:
+    """识别可继续页内搜索的普通界面，独立于当前关键词。"""
+    parsed = urlparse(state.get("url", ""))
+    return (parsed.scheme == "https" and parsed.hostname in SOURCE_HOSTS
+            and parsed.path.rstrip("/") == "/search_result"
+            and state.get("input_visible") is True
+            and state.get("input_id") not in ("search-input-ai", "search-input-in-feeds"))
+
+
+def _open_search_page(page, url: str, evidence: dict, budget: Budget, *, bootstrap=False) -> dict:
+    """一次导航并记录真实主文档事件；超时后只读现场，页面已就绪则继续，不重发请求。"""
+    record = dict(url=url, bootstrap=bootstrap, document_events=[])
+    evidence.setdefault("navigation_records", []).append(record)
+    evidence["navigation_attempts"] = evidence.get("navigation_attempts", 0) + 1
+    evidence["requested_url"] = url
+    def response_seen(response):
+        try:
+            if response.request.is_navigation_request() and response.frame == page.main_frame and len(record["document_events"]) < 12:
+                record["document_events"].append(dict(status=response.status, url=response.url))
+        except Exception:
+            pass
+    observes = hasattr(page, "on")
+    if observes:
+        page.on("response", response_seen)
+    try:
+        try:
+            response = page.goto(url, wait_until="domcontentloaded", timeout=budget.check(30_000))
+            evidence["http_status"] = response.status if response else None
+        except Exception as exc:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+            record["final_url"] = page.url
+            if type(exc).__name__ != "TimeoutError":
+                raise
+            budget.check()
+            state = _snapshot(page, budget, evidence.get("http_status"))
+            record["timeout_snapshot"] = state
+            if _block(state):
+                return state
+            if not (state.get("input_visible") and (bootstrap or _ordinary_surface(state))):
+                raise
+            record["continued_from_visible_page"] = True
+            return state
         until = min(budget.deadline, time.monotonic() + 20)
         while True:
             state = _snapshot(page, budget, evidence.get("http_status"))
             if _block(state) or state.get("input_visible") or time.monotonic() >= until:
-                break
-            budget.pause(200)
+                record["final_url"] = state.get("url")
+                return state
+            budget.pause(100)
+    finally:
+        if observes:
+            page.remove_listener("response", response_seen)
+
+
+def _prepare_current_page(page, request: dict, evidence: dict, budget: Budget, page_ref=None) -> dict:
+    """首次建立普通页，之后在普通输入框切词；完整重试才重新导航。"""
+    phase("prepare_search", "定位搜索框与当前关键词")
+    _observe_native_search(page)
+    state = _snapshot(page, budget)
+    evidence["initial_snapshot"] = state
+    fresh = request.get("fresh_search", False)
+    previous_ids = None
+    previous_sequence = 0
+    search_url = _normal_search_url(request["keyword"])
+    if state.get("url") == "about:blank":
+        # 冷启动先让站点建立页面上下文，再进入普通结果；该初始化每个页面只做一次。
+        if request["capture_kind"] == "results":
+            phase("prepare_search", "初始化平台页面会话")
+            state = _open_search_page(page, "https://www.xiaohongshu.com/explore", evidence, budget, bootstrap=True)
+            evidence["bootstrap_navigation"] = True
+        else:
+            state = _open_search_page(page, search_url, evidence, budget)
     if _block(state):
         return state
     parsed = urlparse(state.get("url", ""))
@@ -869,18 +987,29 @@ def _prepare_current_page(page, request: dict, evidence: dict, budget: Budget, p
         evidence["preparation_problem"] = "unexpected_source_url"
         return state
     if request["capture_kind"] == "results":
-        navigate = fresh or not _normal_search_matches(state, request["keyword"])
+        navigate = fresh or not _ordinary_surface(state)
         if navigate:
-            # 切词和重试使用相同普通入口；不让首页/AI页的搜索按钮决定另一个界面。
-            if not evidence.get("navigation_attempts"):
-                response = page.goto(search_url, wait_until="domcontentloaded", timeout=budget.check(30_000))
-                evidence.update(navigation_attempts=1, requested_url=search_url,
-                                http_status=response.status if response else None)
+            state = _open_search_page(page, search_url, evidence, budget)
             evidence["normal_search_navigation"] = True
             evidence["fresh_search_navigation"] = fresh
-            state = _snapshot(page, budget, evidence.get("http_status"))
             if _block(state):
                 return state
+        elif (not _normal_search_matches(state, request["keyword"]) or state.get("keyword") != request["keyword"]
+              or state.get("search_tab") != "综合"):
+            # 原批次后6词已实跑的流程：普通框fill，再点击原生搜索按钮，不调用goto。
+            field = _input_control(page, state)
+            previous_ids = [item.get("id") for item in state.get("results", [])]
+            previous_sequence = state.get("search_sort_evidence", {}).get("sequence", 0)
+            field.fill(request["keyword"], timeout=budget.check(3000))
+            evidence["keyword_fill_attempts"] = 1
+            submit = page.locator('.submit-button-wrapper:visible,img.standard-search-icon:visible')
+            if hasattr(submit, "count") and submit.count() == 1:
+                submit.click(timeout=budget.check(3000))
+                evidence["search_control"] = "platform_search_button"
+            else:
+                field.press("Enter", timeout=budget.check(10000))
+                evidence["search_control"] = "input_enter"
+            evidence.update(search_submit_attempts=1, keyword_input_completed=True, page_reused=True)
         else:
             evidence["page_reused"] = True
             # 上次下拉仍展开时只收起，不重新提交搜索。
@@ -958,11 +1087,15 @@ def _prepare_current_page(page, request: dict, evidence: dict, budget: Budget, p
             field.fill(request["keyword"], timeout=budget.check(2000))
             budget.check()
             evidence.update(keyword_input_completed=True, keyword_fill_attempts=1)
-    ready = _settled(page, request, budget, evidence.get("http_status"))
+    settling_request = (dict(request, _previous_result_ids=previous_ids, _previous_search_sequence=previous_sequence)
+                        if previous_ids is not None else request)
+    ready = _settled(page, settling_request, budget, evidence.get("http_status"))
     if request["capture_kind"] == "results" and not _block(ready) and not _normal_search_matches(ready, request["keyword"]):
         evidence["preparation_problem"] = "ordinary_search_surface_not_confirmed"
     if ready.get("wait_reason"):
         evidence["preparation_problem"] = ready["wait_reason"]
+    if request["capture_kind"] == "results" and not _block(ready) and ready.get("search_tab") != "综合":
+        evidence["preparation_problem"] = "comprehensive_tab_not_verified"
     if request["capture_kind"] == "results" and not _block(ready) and not ready.get("wait_reason"):
         if (ready.get("scroll", {}).get("at_top") is not True
                 or ready.get("scroll", {}).get("top", 0) > 1

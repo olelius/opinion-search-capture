@@ -82,6 +82,9 @@ class PageDouble:
         self.calls.append(("press", key))
         if key == "Enter":
             self.state = page_state(self.state["keyword"])
+            # 模拟新请求更新结果身份，避免把输入框变了但旧卡片未更新当成就绪。
+            self.state["results"][0]["id"] = hashlib.sha256(self.state["keyword"].encode()).hexdigest()[:24]
+            self.state["results"][0]["href"] = "https://www.xiaohongshu.com/explore/" + self.state["results"][0]["id"]
         self.state.update(suggestion_panel_rect=None, suggestion_panel_associated=False, suggestions=[])
 
     def goto(self, url, **kwargs):
@@ -140,9 +143,9 @@ class PageReuseTests(unittest.TestCase):
         changed = PageDouble(page_state("旧词"))
         result = self.run_page(changed)
         self.assertEqual(result["status"], "success")
-        self.assertEqual(sum(call[0] == "goto" for call in changed.calls), 1)
-        self.assertEqual(sum(call[0] == "fill" for call in changed.calls), 0)
-        self.assertEqual(sum(call == ("press", "Enter") for call in changed.calls), 0)
+        self.assertEqual(sum(call[0] == "goto" for call in changed.calls), 0)
+        self.assertEqual(sum(call[0] == "fill" for call in changed.calls), 1)
+        self.assertEqual(sum(call == ("press", "Enter") for call in changed.calls), 1)
         mismatch = PageDouble(page_state())
         mismatch.state["url"] = "https://www.xiaohongshu.com/explore"
         result = self.run_page(mismatch)
@@ -152,7 +155,7 @@ class PageReuseTests(unittest.TestCase):
         blank = PageDouble(page_state())
         blank.state["url"] = "about:blank"
         self.assertEqual(self.run_page(blank)["status"], "success")
-        self.assertEqual(sum(call[0] == "goto" for call in blank.calls), 1)
+        self.assertEqual(sum(call[0] == "goto" for call in blank.calls), 2)
 
     def test_reused_page_restores_top_and_dismisses_panel_without_navigation(self):
         state = page_state(kind="suggestions")
