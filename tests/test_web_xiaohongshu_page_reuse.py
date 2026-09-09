@@ -85,9 +85,9 @@ class PageDouble:
         self.state.update(suggestion_panel_rect=None, suggestion_panel_associated=False, suggestions=[])
 
     def goto(self, url, **kwargs):
-        from urllib.parse import parse_qs, urlparse
+        from urllib.parse import parse_qs, urlparse, unquote
         self.calls.append(("goto", url))
-        self.state = page_state(parse_qs(urlparse(url).query).get("keyword", [""])[0])
+        self.state = page_state(unquote(parse_qs(urlparse(url).query).get("keyword", [""])[0]))
         self.state["url"] = url
         return None
 
@@ -140,15 +140,15 @@ class PageReuseTests(unittest.TestCase):
         changed = PageDouble(page_state("旧词"))
         result = self.run_page(changed)
         self.assertEqual(result["status"], "success")
-        self.assertEqual(sum(call[0] == "goto" for call in changed.calls), 0)
-        self.assertEqual(sum(call[0] == "fill" for call in changed.calls), 1)
-        self.assertEqual(sum(call == ("press", "Enter") for call in changed.calls), 1)
+        self.assertEqual(sum(call[0] == "goto" for call in changed.calls), 1)
+        self.assertEqual(sum(call[0] == "fill" for call in changed.calls), 0)
+        self.assertEqual(sum(call == ("press", "Enter") for call in changed.calls), 0)
         mismatch = PageDouble(page_state())
         mismatch.state["url"] = "https://www.xiaohongshu.com/explore"
         result = self.run_page(mismatch)
         self.assertEqual(result["status"], "success")
-        self.assertEqual(sum(call[0] == "goto" for call in mismatch.calls), 0)
-        self.assertEqual(sum(call == ("press", "Enter") for call in mismatch.calls), 1)
+        self.assertEqual(sum(call[0] == "goto" for call in mismatch.calls), 1)
+        self.assertEqual(sum(call == ("press", "Enter") for call in mismatch.calls), 0)
         blank = PageDouble(page_state())
         blank.state["url"] = "about:blank"
         self.assertEqual(self.run_page(blank)["status"], "success")
