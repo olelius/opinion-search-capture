@@ -13,6 +13,7 @@
 - 10词实拍证据：.local/manual-runs/ten-keywords-20260909-161937/verification.json及批次报告；关键词顺序完全匹配，无缺失位置、page_count=1。C11两次attempt后仍为target_images_or_screenshot_coverage_incomplete/scroll_stalled_without_complete_evidence，保留未完整截图；第一行按最高图对齐，因此其他较短图下面有留白。
 - 无头对比原始报告：.local/exports/.capture-state/runs/0e72b1aeb69a46c8b9377fd0b4e36abf/report-d909e8a9a49c4ddd95fc561715686959.json。本次C11在/search_result_ai路由也呈5列，故URL名称不是列数充分依据；实际结果区宽度和滚动容器才是本次直接证据。
 - 普通入口修复的单词验证失败报告保留于5aacd6批次（3次attempt：上下文切换、DOMContentLoaded导航超时、commit导航超时）。只读等待定点通过；切换导航等待事件未解决该超时，未保留该推测性改动。没有验证其他关键词或整批重跑。
+- 逐项复核原10词记录：前3词为search_result_ai/search-input-ai/4列；C11第2次attempt切到search_result/search-input/5列；后6词最终全部普通页5列。C16/B10/B01/A10沿普通输入框切词首轮成功，A05/T03则普通页重试后成功。当前实现将普通页异词也改成整页goto，偏离已实跑成功的页内换词流程；超时底层原因尚未证实，后续应保留已验证的普通页内换词，而不是把页面模式与导航超时混为一因。
 - APP切片：单条ADB shell完成320ms移动＋180ms末端停留，保留80%目标和末段缩短，移除固定0.6秒等待；动作实际耗时单独记录。加载共享25秒预算，不补滑；TOP N已完整则不等页底加载指示消失。相关新定点及旧手势/封面合同已通过。
 - WEB切片：统一80%滚动、60ms稳定对，删除多余固定等待；首轮同词复用，重试单次重新导航并确认页首，下拉只重新展开/清空重填（缺页时正常初始化），不先采集TOP N。8项新定点及2项直接回归通过。
 - 主执行者：暂时加载失败的有限重试、从头搜索标记、独立attempt目录和重试报告字段；浏览器工作进程总超时恢复可重试。6项新增定点及1项原有重试合同通过，取消后不再派发，恢复只重跑失败关键词。
