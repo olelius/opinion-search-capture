@@ -94,7 +94,7 @@ def validate_plan_data(data: dict) -> dict:
             raise ValueError("原图和拼图文件名模板均须为单个 .png 文件名")
     columns = result["composite_columns"]
     if type(columns) is not int or not 1 <= columns <= 100:
-        raise ValueError("拼图列数须为 1 至 100 的整数")
+        raise ValueError("每行关键词数须为 1 至 100 的整数")
     if not Path(result["output_root"]).is_absolute():
         raise ValueError("导出根目录须为绝对路径")
     profile_root = result.get("browser_profile_root")
@@ -170,13 +170,11 @@ OPTIONAL_FIELDS = {
     "schedule_grace_seconds": ("计划触发宽限 / 秒", 0, 3600, 120),
     "max_queue_delay_seconds": ("队列最长等待 / 秒", 1, 86400, 900),
     "composite_cell_width": ("拼图单元宽度 / 像素", 64, 4096, 1080),
-    "composite_max_pixels": ("每张拼图像素上限", 100000, 100000000, 50000000),
-    "composite_max_height": ("每张拼图高度上限", 256, 100000, 24000),
 }
 FIELD_LABELS = {
     "project": "项目名称", "platform": "平台名称", "client": "APP / WEB", "keyword": "关键词（含身份后缀）",
     "keyword_id": "关键词唯一身份", "year": "年份", "month": "月份", "day": "日期（日）",
-    "display_type": "展示类型", "top_n": "TOP N", "batch": "批次序号", "part": "分图页码",
+    "display_type": "展示类型", "top_n": "TOP N", "batch": "批次序号", "part": "图片序号（汇总固定1）",
     "content_label": "内容标签", "capture_stamp": "实际截图时间", "artifact_id": "图片唯一身份",
 }
 
@@ -439,14 +437,16 @@ class MainWindow(QMainWindow):
             self._template_row(field, label, form)
         self.composite_columns_spin = QSpinBox()
         self.composite_columns_spin.setRange(1, 100)
-        form.addRow("拼图列数", self.composite_columns_spin)
+        self.composite_columns_spin.setToolTip("网格按此关键词数换行；横排保持单行，不使用此值换行。")
+        form.addRow("每行关键词数", self.composite_columns_spin)
         self.layout_combo = QComboBox()
-        self.layout_combo.addItem("网格布局", "grid")
-        self.layout_combo.addItem("横向排列", "horizontal")
+        self.layout_combo.addItem("网格（按列数换行，单张 PNG）", "grid")
+        self.layout_combo.addItem("横排（单行 PNG）", "horizontal")
         self.layout_combo.setEnabled("composite_layout" in self._core_fields)
         form.addRow("拼图布局", self.layout_combo)
-        self._optional(form, ("composite_cell_width", "composite_max_pixels", "composite_max_height"))
-        note = QLabel("图片永不覆盖；唯一身份区分新产物。分页取决于核心实际图片尺寸，预检不代表已经生成图片。")
+        self._optional(form, ("composite_cell_width",))
+        note = QLabel("每组仅一张 PNG，无人工像素或高度上限；网格按每行关键词数换行，横排始终单行。"
+                      "图片永不覆盖；唯一身份区分新产物，预检不代表已经生成图片。")
         note.setWordWrap(True)
         form.addRow(note)
         box.addWidget(group)
@@ -935,7 +935,7 @@ class MainWindow(QMainWindow):
             self.preflight_details.setPlainText("\n".join(lines))
             self._preview_snapshot = copy.deepcopy(self._preview_request)
             passed = bool(result["ok"]) and not result.get("errors")
-            self.preflight_label.setText(f"{'预检通过' if passed else '预检发现错误'} · {len(rows)} 条路径；实际日期、身份及分页以采集时为准")
+            self.preflight_label.setText(f"{'预检通过' if passed else '预检发现错误'} · {len(rows)} 条路径；每组单张 PNG，实际日期、身份及尺寸以采集时为准")
         except Exception as exc:
             self.path_model.replace([])
             self.preflight_label.setText("预检返回格式异常")

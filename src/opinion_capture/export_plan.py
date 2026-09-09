@@ -64,14 +64,14 @@ def _directory_check(directory: Path, probe: bool) -> dict:
 def preflight_plan(plan, *, planned_at: datetime | None = None,
                    probe_writable: bool = False, batch_number: int = 1,
                    verified_existing_paths=()) -> dict:
-    """预览一批代表性原图和各组第一页，不写配置/图片/数据库。
+    """预览一批代表性原图和各组单张汇总图，不写配置/图片/数据库。
 
     返回 ok/errors/warnings/raw_paths/composite_paths，以及 preview、originals、
     composites 别名；errors/warnings 元素为 code/message/context 字典。
     同批所有任务使用同一个示例 capture_stamp，避免以未知截图时刻证明唯一。
     artifact_id 是确定性预览代号；界面默认batch=1，执行器可提供实际编号。
     verified_existing_paths仅供已核对哈希的恢复路径；其他已有文件仍拒绝覆盖。
-    原图帧数、汇总页数、partial 状态及跨午夜实际目录都应在执行时重新校验。
+    汇总图 part 固定为 1；原图帧数、汇总尺寸、partial 状态及跨午夜实际目录在执行时重新校验。
     probe_writable=False 为只读检查；True 仅增加临时可写探针，无目录树生成。
     """
     from .config import DEFAULT_DIRECTORY, DEFAULT_FILENAME, PLATFORMS
@@ -84,11 +84,14 @@ def preflight_plan(plan, *, planned_at: datetime | None = None,
               "raw_paths": raw_paths, "composite_paths": composite_paths,
               "originals": raw_paths, "composites": composite_paths, "preview": [],
               "counts": {"tasks": 0, "groups": 0}, "writable_checks": [],
+              "composition": {"single_image": True, "composite_max_pixels": None,
+                              "composite_max_height": None},
               "planned_at": None, "sample_batch": batch_number, "fields": sorted(FIELDS),
               "boundaries": [
                   "planned_at 仅为路径示例日期，不是 captured_at；全部任务共享示例时间戳。",
-                  "预览 artifact_id 未预占，实际执行须分配唯一 ID 并对每一页/帧再次排他发布。",
-                  "预检不证明未来截图时间戳唯一，不预知帧数、页数、状态或跨午夜/跨月日期。",
+                  "预览 artifact_id 未预占，实际执行须分配唯一 ID 并对每张图片再次排他发布。",
+                  "每组汇总为单张 PNG，网格按列数换行，横排保持单行；part 固定为 1，旧像素/高度上限不参与计算。",
+                  "预检不证明未来截图时间戳唯一，不预知原图帧数、汇总尺寸、状态或跨午夜/跨月日期。",
                   "目录可写性、占用和磁盘容量可在预检后变化；probe=False 没有执行写入。",
                   "身份分组依据完整关键词及年/月/日/平台/端/种类元数据，不依据路径子串。",
               ]}
@@ -130,9 +133,8 @@ def preflight_plan(plan, *, planned_at: datetime | None = None,
     top_n = _get(plan, "top_n", 20)
     if type(top_n) is not int or not 1 <= top_n <= 1000:
         errors.append(_issue("INVALID_FIELD", "top_n 应为 1 至 1000 的整数", field="top_n"))
-    report["composition"] = {}
-    for field, default in (("composite_columns", 4), ("composite_cell_width", 1080),
-                           ("composite_max_pixels", 50_000_000), ("composite_max_height", 24000)):
+    # 只读取有效布局参数；旧 cap 字段无论是否存在，都不参与预检及报告中的有效上限。
+    for field, default in (("composite_columns", 4), ("composite_cell_width", 1080)):
         value = _get(plan, field, default)
         report["composition"][field] = value
         if type(value) is not int or value < 1:
@@ -160,9 +162,9 @@ def preflight_plan(plan, *, planned_at: datetime | None = None,
             if "year" not in used:
                 warnings.append(_issue("YEAR_NOT_EXPLICIT", "模板未显式包含 year；月份目录本身不区分年份，身份仍须依元数据", kind=kind))
             if "artifact_id" not in used:
-                warnings.append(_issue("NO_ARTIFACT_ID", "模板未含 artifact_id；重复执行、同刻多帧需重新检验同名冲突", kind=kind))
-            if not ({"part", "artifact_id"} & used):
-                warnings.append(_issue("MULTIPART_COLLISION", "多帧/多页共用时间戳时同名；请加入 part 或每张独立 artifact_id", kind=kind))
+                warnings.append(_issue("NO_ARTIFACT_ID", "模板未含 artifact_id；重复执行需重新检验同名冲突", kind=kind))
+            if kind == "raw" and not ({"part", "artifact_id"} & used):
+                warnings.append(_issue("MULTIPART_COLLISION", "原图多帧共用时间戳时同名；请加入 part 或每张独立 artifact_id", kind=kind))
         except (ValueError, TypeError) as exc:
             errors.append(_issue("INVALID_TEMPLATE", str(exc), kind=kind))
     if errors:
@@ -180,8 +182,12 @@ def preflight_plan(plan, *, planned_at: datetime | None = None,
         item = {"kind": kind, "index": index, "platform": platform, "client": client,
                 "capture_kind": capture_kind, "keyword": keyword, "keyword_id": keyword_id(keyword),
                 "part": 1, "values": values, "path": None, "estimated": True,
-                "unresolved_fields": ["captured_at", "artifact_id", "batch", "part_count", "status"],
+                "unresolved_fields": ["captured_at", "artifact_id", "batch", "status"],
                 "group_key": [now.year, now.month, now.day, platform, client, capture_kind]}
+        if kind == "raw":
+            item["unresolved_fields"].append("part_count")
+        else:
+            item["single_image"] = True
         directory, filename = templates[kind]
         try:
             path = export_path(root, directory, filename, values)
@@ -203,7 +209,7 @@ def preflight_plan(plan, *, planned_at: datetime | None = None,
                           "capture_stamp": f"{now.year + 1:04d}" + values["capture_stamp"][4:]}
                 if path_identity(export_path(root, directory, filename, future)) == identity_path:
                     warnings.append(_issue("CROSS_YEAR_COLLISION", "相同月日的跨年任务将复用此路径", kind=kind, path=str(path)))
-            if "part" not in fields_by_kind[kind] and "artifact_id" in fields_by_kind[kind]:
+            if kind == "raw" and "part" not in fields_by_kind[kind] and "artifact_id" in fields_by_kind[kind]:
                 item["requires_unique_id_per_part"] = True
             # partial 会改变 content_label，检查最长常见状态路径，避免仅成功示例通过长度验证。
             partial_values = {**values, "content_label": values["content_label"] + "-未完整验证"}
@@ -238,7 +244,6 @@ def preflight_plan(plan, *, planned_at: datetime | None = None,
             errors.append(_issue("NOT_WRITABLE", str(exc), directory=str(directory)))
     if not probe_writable:
         warnings.append(_issue("WRITABILITY_NOT_PROBED", "本次仅检查父目录和权限迹象；未执行临时写入探针"))
-    warnings.append(_issue("UNKNOWN_PAGE_COUNT", "这里只展示每组第一页；实际尺寸到齐后才计算页数和最终各页路径"))
     report["preview"] = [*raw_paths, *composite_paths]
     report["counts"] = {"tasks": len(raw_paths), "groups": len(composite_paths), "preview_paths": len(report["preview"])}
     report["ok"] = not errors

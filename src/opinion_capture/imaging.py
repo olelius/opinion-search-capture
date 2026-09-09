@@ -5,10 +5,13 @@ from __future__ import annotations
 import math
 import os
 import tempfile
+import struct
+import zlib
+from contextlib import ExitStack, closing
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image, ImageChops, ImageStat, PngImagePlugin
 
 from .exporting import export_path, path_identity, publish_immutable
 
@@ -63,18 +66,26 @@ def _budget(width: int, height: int, limit: int) -> None:
         raise ImagingError(f"像素预算超限：{width}×{height} > {limit}")
 
 
-def _size(path: Path, limit: int) -> tuple[int, int]:
-    """只读文件头并检查单输入像素上限，多帧文件需调用方先拆帧。"""
-    with Image.open(path) as im:
-        _budget(im.width, im.height, limit)
+def _open_source(path: Path, *, unrestricted_png: bool = False):
+    """汇总原生PNG按文件格式读取，不修改Pillow全局像素阈值影响并行采集。"""
+    if unrestricted_png and path.suffix.lower() == ".png":
+        return PngImagePlugin.PngImageFile(path)
+    return Image.open(path)
+
+
+def _size(path: Path, limit: int | None) -> tuple[int, int]:
+    """只读文件头；limit为None时不使用业务像素阈值，多帧输入仍须先拆帧。"""
+    with _open_source(path, unrestricted_png=limit is None) as im:
+        if limit is not None:
+            _budget(im.width, im.height, limit)
         if getattr(im, "n_frames", 1) != 1:
             raise ImagingError(f"输入须为单帧图片：{path}")
         return im.size
 
 
-def _read(path: Path) -> Image.Image:
+def _read(path: Path, *, unrestricted_png: bool = False) -> Image.Image:
     """读取为独立 RGB 像素，透明区域铺白，绝不写回原文件。"""
-    with Image.open(path) as im:
+    with _open_source(path, unrestricted_png=unrestricted_png) as im:
         if im.mode in ("RGBA", "LA") or "transparency" in im.info:
             rgba = im.convert("RGBA")
             bg = Image.new("RGBA", im.size, "white")
@@ -142,26 +153,111 @@ def compose_grid(image_paths: Iterable[str | Path], output_path: str | Path,
     return dict(result, inputs=[str(p) for p in paths], columns=cols, placements=placements)
 
 
+def _png_chunk(stream, kind: bytes, payload: bytes) -> None:
+    """写入带CRC的PNG数据块；每个IDAT块至多1MiB，不依赖完整画布。"""
+    stream.write(struct.pack(">I", len(payload)) + kind)
+    stream.write(payload)
+    stream.write(struct.pack(">I", zlib.crc32(payload, zlib.crc32(kind)) & 0xffffffff))
+
+
+def _composite_scanlines(rows, width: int, cell_width: int, gap: int, cache_root: Path):
+    """每行仅暂存本行源图RGB到磁盘，再逐扫描线拼接；内存不随总画布高度增长。"""
+    white = b"\xff" * (width * 3)
+    for _ in range(gap):
+        yield white
+    for row in rows:
+        with tempfile.TemporaryDirectory(prefix=".compose-cache-", dir=cache_root) as cache, ExitStack() as stack:
+            streams = []
+            for col, unit in enumerate(row):
+                raw = Path(cache) / f"{col}.rgb"
+                with _read(Path(unit["path"]), unrestricted_png=True) as source, raw.open("wb") as target:
+                    if list(source.size) != unit["source_size"]:
+                        raise ImagingError("输入尺寸在排版后变化，请冻结原图后重试")
+                    resized = source if source.size == unit["size"] else source.resize(unit["size"], Image.Resampling.LANCZOS)
+                    try:
+                        # 阈值只用于细分内存块，不限制整图；避免tobytes复制完整长图。
+                        strip_height = min(128, max(1, (Image.MAX_IMAGE_PIXELS or 4_194_304) // resized.width))
+                        for top in range(0, resized.height, strip_height):
+                            with resized.crop((0, top, resized.width, min(top + strip_height, resized.height))) as strip:
+                                target.write(strip.tobytes())
+                    finally:
+                        if resized is not source:
+                            resized.close()
+                streams.append(stack.enter_context(raw.open("rb")))
+            for y in range(max(u["card_height"] for u in row)):
+                scanline = bytearray(white)
+                for col, (unit, source) in enumerate(zip(row, streams)):
+                    if y >= unit["size"][1]:
+                        continue
+                    count = unit["size"][0] * 3
+                    pixels = source.read(count)
+                    if len(pixels) != count:
+                        raise ImagingError("图片像素缓存提前结束，未发布汇总图")
+                    left = (gap + col * (cell_width + gap)) * 3
+                    scanline[left:left + count] = pixels
+                yield bytes(scanline)
+        for _ in range(gap):
+            yield white
+
+
+def _save_scanlines(width: int, height: int, rows, output: Path) -> dict:
+    """将所有扫描线写入同一PNG，完整校验后排他发布；失败不拆图、不留下半张成品。"""
+    # PNG格式规定宽高使用正的31位整数；这是格式边界，而非业务分页阈值。
+    if not (0 < width <= 0x7fffffff and 0 < height <= 0x7fffffff):
+        raise ImagingError("尺寸超出PNG格式范围，未生成或拆分汇总图")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".compose-", suffix=".tmp", dir=output.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as stream, closing(rows):
+            stream.write(b"\x89PNG\r\n\x1a\n")
+            _png_chunk(stream, b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            encoder = zlib.compressobj()
+            count = 0
+            for scanline in rows:
+                if len(scanline) != width * 3 or count >= height:
+                    raise ImagingError("汇总扫描线尺寸不匹配，未发布图片")
+                compressed = encoder.compress(b"\0" + scanline)
+                for index in range(0, len(compressed), 1024 * 1024):
+                    _png_chunk(stream, b"IDAT", compressed[index:index + 1024 * 1024])
+                count += 1
+            if count != height:
+                raise ImagingError("汇总扫描线数量不完整，未发布图片")
+            compressed = encoder.flush()
+            for index in range(0, len(compressed), 1024 * 1024):
+                _png_chunk(stream, b"IDAT", compressed[index:index + 1024 * 1024])
+            _png_chunk(stream, b"IEND", b"")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # 直接读取已知PNG，核对尺寸及所有块CRC，不改变全局解码配置。
+        with PngImagePlugin.PngImageFile(temporary) as check:
+            if check.size != (width, height):
+                raise ImagingError("汇总PNG尺寸校验失败")
+            check.verify()
+        publication = publish_immutable(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {"path": str(output), "width": width, "height": height, "pixels": width * height,
+            "format": "PNG", "publication": publication, "encoding": "streamed_rgb_rows"}
+
+
 def compose_pages(image_paths: Iterable[str | Path | None], output_dir: str | Path, *,
                   members: Iterable[Mapping] | None = None, layout: str = "grid",
                   columns: int = 4, cell_width: int = 1080, gap: int = 16,
-                  max_pixels: int = DEFAULT_MAX_PIXELS, max_height: int = 24000,
-                  max_input_pixels: int = DEFAULT_MAX_PIXELS,
+                  max_pixels: int | None = None, max_height: int | None = None,
+                  max_input_pixels: int | None = None,
                   filename_template: str = "page_{part:02d}.png",
                   output_path_factory: Callable[[int], str | Path] | None = None) -> dict:
-    """按冻结顺序输出完整单元的多页汇总，页号从 1 起，全局 index 从 0 起。
+    """按冻结顺序输出一张汇总图；兼容旧函数名和pages返回结构，part固定为1。
 
     image_paths 与 members 一一对应；只排版有效图片，不添加标题、状态条或
     文字占位卡。缺图/失败状态保存在members和omitted_members，不冒充成功内容。
-    所有图片只等比例缩小、不放大小图、不裁切；若单元独占一页仍超限，
-    抛 ImagingError，调用方应明确调整宽度/预算，而非横切文字或猜拼。
-    output_path_factory(part) 优先于文件模板；所有目标先检查再写，路径须在
-    output_dir 下。发生后续页写入错误时，已发布的完整页仍保留，不宣称整批
-    原子性；调用方仅在函数成功后将整个返回清单登记为完成。
+    grid按columns换行，horizontal单行；只按用户cell_width等比例缩小，
+    不为适配尺寸额外缩图。旧max_pixels/max_height/max_input_pixels参数不再生效。
+    按行缓存、流式写入一个PNG；内存/磁盘/格式失败明确报错，不拆图。路径与
+    不覆盖合同不变；没有有效输入时pages为空，否则只含一张完整成品。
     """
-    for name, value in (("columns", columns), ("cell_width", cell_width),
-                        ("max_pixels", max_pixels), ("max_height", max_height),
-                        ("max_input_pixels", max_input_pixels)):
+    for name, value in (("columns", columns), ("cell_width", cell_width)):
         _integer(name, value)
     _integer("gap", gap, 0)
     if layout not in ("grid", "horizontal"):
@@ -183,7 +279,7 @@ def compose_pages(image_paths: Iterable[str | Path | None], output_dir: str | Pa
             omitted.append({"index": index, "order": index + 1, "keyword": member.get("keyword"),
                             "status": status, "member": member, "reason": "no_usable_image"})
             continue
-        size = _size(path, max_input_pixels)
+        size = _size(path, None)
         scaled = (min(cell_width, size[0]), max(1, round(size[1] * min(cell_width, size[0]) / size[0])))
         units.append({"index": index, "order": index + 1, "path": str(path) if path else None,
                       "keyword": member.get("keyword"), "status": status, "member": member,
@@ -194,7 +290,7 @@ def compose_pages(image_paths: Iterable[str | Path | None], output_dir: str | Pa
         return {"pages": [], "page_count": 0, "members": metadata, "omitted_members": omitted,
                 "status": "partial", "reason": "no_usable_images", "layout": layout,
                 "cell_width": cell_width, "order": list(range(len(raw_paths))),
-                "rendered_order": [], "added_annotations": False,
+                "rendered_order": [], "added_annotations": False, "single_image": True,
                 "boundaries": ["没有有效图片时不生成文字占位图，缺失信息仅保存在清单。"]}
 
     def dimensions(rows):
@@ -203,31 +299,10 @@ def compose_pages(image_paths: Iterable[str | Path | None], output_dir: str | Pa
         return (cols * cell_width + (cols + 1) * gap,
                 sum(max(u["card_height"] for u in row) for row in rows) + (len(rows) + 1) * gap)
 
-    def fits(rows):
-        width, height = dimensions(rows)
-        return height <= max_height and width * height <= max_pixels
-
-    pages_rows, rows = [], []
     target_columns = len(units) if layout == "horizontal" else columns
-    for unit in units:
-        if not fits([[unit]]):
-            raise ImagingError(f"第 {unit['order']} 个完整单元独占一页仍超限；请显式调整 cell_width/max_height/max_pixels")
-        if not rows:
-            rows = [[unit]]
-            continue
-        if len(rows[-1]) < target_columns:
-            extended = [*rows[:-1], [*rows[-1], unit]]
-            if fits(extended):
-                rows = extended
-                continue
-        if layout == "grid" and fits([*rows, [unit]]):
-            rows = [*rows, [unit]]
-        else:
-            pages_rows.append(rows)
-            rows = [[unit]]
-    pages_rows.append(rows)
+    pages_rows = [[units[index:index + target_columns] for index in range(0, len(units), target_columns)]]
 
-    # 先计算全部目标，防止常见模板漏掉 part 导致写完第一页才发现第二页撞名。
+    # 沿用原路径合同；单张汇总的part固定1，先校验目标再开始写入。
     outputs, identities = [], set()
     source_ids = {path_identity(p) for p in raw_paths if p is not None}
     for part in range(1, len(pages_rows) + 1):
@@ -265,40 +340,29 @@ def compose_pages(image_paths: Iterable[str | Path | None], output_dir: str | Pa
         try:
             width, height = dimensions(page_rows)
             placements = []
-            with Image.new("RGB", (width, height), "white") as canvas:
-                y = gap
-                for row_number, row in enumerate(page_rows):
-                    for col, unit in enumerate(row):
-                        x = gap + col * (cell_width + gap)
-                        image_y = y
-                        if unit["path"]:
-                            with _read(Path(unit["path"])) as source:
-                                if list(source.size) != unit["source_size"]:
-                                    raise ImagingError("输入尺寸在排版后变化，请冻结原图后重试")
-                                if source.size == unit["size"]:
-                                    canvas.paste(source, (x, image_y))
-                                else:
-                                    with source.resize(unit["size"], Image.Resampling.LANCZOS) as resized:
-                                        canvas.paste(resized, (x, image_y))
-                        placements.append({k: unit[k] for k in ("index", "order", "path", "keyword", "status", "member", "source_size")}
-                                          | {"page": part, "part": part, "row": row_number, "column": col,
-                                             "x": x, "y": image_y, "width": unit["size"][0], "height": unit["size"][1],
-                                             "card_box": [x, y, x + cell_width, y + unit["card_height"]],
-                                             "label_box": None, "placeholder": False})
-                    y += max(u["card_height"] for u in row) + gap
-                result = _save(canvas, output)
+            y = gap
+            for row_number, row in enumerate(page_rows):
+                for col, unit in enumerate(row):
+                    x = gap + col * (cell_width + gap)
+                    placements.append({k: unit[k] for k in ("index", "order", "path", "keyword", "status", "member", "source_size")}
+                                      | {"page": 1, "part": 1, "row": row_number, "column": col,
+                                         "x": x, "y": y, "width": unit["size"][0], "height": unit["size"][1],
+                                         "card_box": [x, y, x + cell_width, y + unit["card_height"]],
+                                         "label_box": None, "placeholder": False})
+                y += max(u["card_height"] for u in row) + gap
+            result = _save_scanlines(width, height, _composite_scanlines(page_rows, width, cell_width, gap, output.parent), output)
             pages.append(result | {"page": part, "part": part, "page_count": len(outputs),
                                    "columns": max(len(row) for row in page_rows), "placements": placements,
                                    "members": [p["member"] for p in placements], "order": [p["index"] for p in placements],
                                    "inputs": [p["path"] for p in placements if p["path"]],
-                                   "omitted_members": omitted, "added_annotations": False})
+                                   "omitted_members": omitted, "added_annotations": False, "single_image": True})
         except Exception as exc:
             raise PageCompositionError(str(exc), pages, part, len(outputs)) from exc
     return {"pages": pages, "page_count": len(pages), "members": metadata, "omitted_members": omitted,
             "status": "success" if not omitted and all(u["status"] == "success" for u in units) else "partial",
             "layout": layout, "cell_width": cell_width, "order": list(range(len(raw_paths))),
-            "rendered_order": [u["index"] for u in units], "added_annotations": False,
-            "boundaries": ["整图分页，不横切文字；单元自身超限需显式调整预算。", "逐页排他发布，不承诺多文件事务。"]}
+            "rendered_order": [u["index"] for u in units], "added_annotations": False, "single_image": True,
+            "boundaries": ["每组一张PNG，按列数换行，不按像素/高度拆图。", "资源或PNG格式限制导致失败时不降清晰度、不发布半张图。"]}
 
 
 def _mae(a: Image.Image, b: Image.Image) -> float:

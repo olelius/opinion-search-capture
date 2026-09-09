@@ -94,20 +94,42 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.window.form_data(), self.data)
 
     def test_composite_controls_save_load_and_core_roundtrip(self):
-        self.window.composite_directory_edit.setText("拼图/{project}/{platform}/{client}")
-        self.window.composite_filename_edit.setText("总览_{artifact_id}.png")
-        self.window.composite_columns_spin.setValue(7)
-        expected = self.window.form_data()
-        self.assertEqual(expected["directory_template"], self.data["directory_template"])
-        self.assertEqual(expected["filename_template"], self.data["filename_template"])
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "composite.json"
-            self.window.save_config(path)
-            self.window.set_form_data(self.data)
-            self.window.load_config(path)
-            self.assertEqual(self.window.form_data(), expected)
-        self.assertEqual(self.window.composite_columns_spin.value(), 7)
-        self.assertEqual(self.window.composite_filename_edit.text(), "总览_{artifact_id}.png")
+        """离屏控件/JSON 往返：旧上限没有输入框，列宽可编辑，布局不被隐式重写。"""
+        from opinion_capture.config import Plan, load_plan
+
+        for field in ("composite_max_pixels", "composite_max_height"):
+            self.assertNotIn(field, self.window.optional_widgets)
+        columns = self.window.composite_columns_spin
+        self.assertEqual(columns.parentWidget().layout().labelForField(columns).text(), "每行关键词数")
+        for layout, pixels, height in (("grid", 50_000_000, 24000), ("horizontal", 0, None)):
+            with self.subTest(layout=layout):
+                self.window.set_form_data({**self.data, "composite_layout": layout,
+                                           "composite_max_pixels": pixels, "composite_max_height": height})
+                self.assertEqual(self.window.layout_combo.currentData(), layout)
+                self.assertIn("PNG", self.window.layout_combo.currentText())
+                self.assertIn("按列数换行" if layout == "grid" else "单行", self.window.layout_combo.currentText())
+                self.window.composite_directory_edit.setText("拼图/{project}/{platform}/{client}")
+                self.window.composite_filename_edit.setText("总览_{artifact_id}.png")
+                columns.setValue(7)
+                self.window.optional_widgets["composite_cell_width"].setValue(720)
+                expected = self.window.form_data()
+                self.assertEqual(expected["composite_layout"], layout)
+                self.assertEqual(expected["composite_columns"], 7)
+                self.assertEqual(expected["composite_cell_width"], 720)
+                self.assertEqual(expected["composite_max_pixels"], pixels)
+                self.assertEqual(expected["composite_max_height"], height)
+                self.assertEqual(expected["directory_template"], self.data["directory_template"])
+                self.assertEqual(expected["filename_template"], self.data["filename_template"])
+                with tempfile.TemporaryDirectory() as temp:
+                    path = Path(temp) / "composite.json"
+                    self.window.save_config(path)
+                    self.assertEqual(load_plan(path).to_dict(), Plan.from_dict(expected).to_dict())
+                    self.window.set_form_data(self.data)
+                    self.window.load_config(path)
+                    self.assertEqual(self.window.form_data(), expected)
+                self.assertEqual(columns.value(), 7)
+                self.assertEqual(self.window.layout_combo.currentData(), layout)
+                self.assertEqual(self.window.composite_filename_edit.text(), "总览_{artifact_id}.png")
         self.assertEqual(self.calls, [])
 
     def test_legacy_config_gets_composite_defaults(self):

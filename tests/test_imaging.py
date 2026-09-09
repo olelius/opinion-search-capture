@@ -183,29 +183,30 @@ class ImagingTests(unittest.TestCase):
         paths = [self.save(f"item-{i}.png", Image.new("RGB", (120, 100), (i * 25, 0, 0))) for i in range(7)]
         result = compose_pages(paths, self.root / "pages", columns=2, cell_width=120, gap=5,
                                max_height=115, max_pixels=30000)
-        self.assertEqual(result["page_count"], 4)
+        self.assertEqual(result["page_count"], 1)
         items = [p for page in result["pages"] for p in page["placements"]]
         self.assertEqual([p["index"] for p in items], list(range(7)))
         for page in result["pages"]:
-            self.assertLessEqual(page["height"], 115)
-            self.assertLessEqual(page["pixels"], 30000)
+            self.assertEqual(page["height"], 425)
+            self.assertGreater(page["pixels"], 30000)
             with Image.open(page["path"]) as im:
                 for item in page["placements"]:
                     self.assertEqual(im.getpixel((item["x"], item["y"])), (item["index"] * 25, 0, 0))
                     self.assertEqual((item["width"], item["height"]), (120, 100))
 
-    def test_horizontal_pixel_limit_splits_without_wrapping(self):
+    def test_horizontal_ignores_old_limit_without_wrapping(self):
         p = self.save("tile.png", Image.new("RGB", (100, 100), "red"))
         result = compose_pages([p] * 5, self.root / "horizontal", layout="horizontal", cell_width=100,
                                gap=0, max_pixels=20000)
-        self.assertEqual(result["page_count"], 3)
-        self.assertEqual([len(page["placements"]) for page in result["pages"]], [2, 2, 1])
+        self.assertEqual(result["page_count"], 1)
+        self.assertEqual([len(page["placements"]) for page in result["pages"]], [5])
         self.assertTrue(all(p["row"] == 0 for page in result["pages"] for p in page["placements"]))
 
-    def test_grid_pixel_limit_can_reduce_columns(self):
+    def test_grid_keeps_configured_columns_despite_old_limit(self):
         p = self.save("tile.png", Image.new("RGB", (100, 100), "red"))
         result = compose_pages([p] * 5, self.root / "grid", columns=4, cell_width=100, gap=0, max_pixels=10000)
-        self.assertEqual(result["page_count"], 5)
+        self.assertEqual(result["page_count"], 1)
+        self.assertEqual(result["pages"][0]["columns"], 4)
 
     def test_missing_and_partial_members_explicit_no_image_crop(self):
         p = self.save("text.png", Image.new("RGB", (600, 200), "blue"))
@@ -239,11 +240,11 @@ class ImagingTests(unittest.TestCase):
         self.assertFalse((self.root / "missing").exists())
         self.assertEqual(len(result["members"]), 2)
 
-    def test_single_cell_over_limit_fails_before_writing_not_sliced(self):
+    def test_single_tall_cell_is_not_sliced_by_old_limit(self):
         p = self.save("tall.png", Image.new("RGB", (100, 501), "red"))
-        with self.assertRaisesRegex(ImagingError, "独占一页仍超限"):
-            compose_pages([p], self.root / "tall-out", cell_width=100, max_height=500, gap=0)
-        self.assertFalse((self.root / "tall-out").exists())
+        result = compose_pages([p], self.root / "tall-out", cell_width=100, max_height=500, gap=0)
+        self.assertEqual(result["page_count"], 1)
+        self.assertEqual(result["pages"][0]["height"], 501)
 
     def test_pages_path_factory_and_index_template(self):
         p = self.save("tile.png", Image.new("RGB", (80, 80), "red"))
@@ -253,29 +254,28 @@ class ImagingTests(unittest.TestCase):
             return self.root / "named" / f"任意文字-{part}.png"
         result = compose_pages([p] * 3, self.root / "named", layout="horizontal", cell_width=80,
                                max_pixels=6400, gap=0, output_path_factory=output)
-        self.assertEqual(calls, [1, 2, 3])
-        self.assertEqual([p["part"] for p in result["pages"]], [1, 2, 3])
+        self.assertEqual(calls, [1])
+        self.assertEqual([p["part"] for p in result["pages"]], [1])
         r = compose_pages([p], self.root / "template", cell_width=80, filename_template="第{index:03d}页.png")
         self.assertEqual(Path(r["pages"][0]["path"]).name, "第001页.png")
 
     def test_all_targets_checked_before_any_page_is_saved(self):
         p = self.save("tile.png", Image.new("RGB", (100, 100), "red"))
         out = self.root / "precheck"
-        for factory in (lambda part: out / "same.png", lambda part: out / ("Case.png" if part == 1 else "case.PNG"),
-                        lambda part: p if part == 2 else out / "first.png"):
+        for factory in (lambda part: p, lambda part: self.root / "outside.png", lambda part: out / "invalid.jpg"):
             with self.assertRaises((FileExistsError, ImagingError)):
                 compose_pages([p, p], out, cell_width=100, gap=0, max_pixels=10000, output_path_factory=factory)
             self.assertFalse(out.exists())
         out.mkdir()
-        (out / "page_02.png").write_bytes(b"keep")
+        (out / "page_01.png").write_bytes(b"keep")
         with self.assertRaises(FileExistsError):
             compose_pages([p, p], out, cell_width=100, gap=0, max_pixels=10000)
-        self.assertFalse((out / "page_01.png").exists())
-        self.assertEqual((out / "page_02.png").read_bytes(), b"keep")
+        self.assertFalse((out / "page_02.png").exists())
+        self.assertEqual((out / "page_01.png").read_bytes(), b"keep")
 
     def test_page_invalid_arguments(self):
         p = self.save("tile.png", Image.new("RGB", (10, 10), "red"))
-        for kwargs in ({"columns": True}, {"max_height": 0}, {"layout": "vertical"}, {"members": []},
+        for kwargs in ({"columns": True}, {"cell_width": 0}, {"layout": "vertical"}, {"members": []},
                        {"filename_template": "../bad.png"}, {"filename_template": "{part.__class__}.png"},
                        {"filename_template": "bad.jpg"}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ImagingError):
@@ -305,7 +305,7 @@ class ImagingTests(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assertFalse(list(self.root.glob("*.tmp")))
 
-    def test_mixed_sizes_grid_pagination_invariants(self):
+    def test_mixed_sizes_single_grid_invariants(self):
         rng = random.Random(20260908)
         paths = [self.save(f"mixed{i}.png", Image.new("RGB", (rng.randint(20, 100), rng.randint(20, 90)),
                                                           (i * 20, 40, 100))) for i in range(10)]
@@ -313,9 +313,8 @@ class ImagingTests(unittest.TestCase):
             result = compose_pages(paths, self.root / f"mixed-out-{columns}", columns=columns, cell_width=80,
                                    gap=3, max_height=180, max_pixels=20000)
             self.assertEqual([p["index"] for page in result["pages"] for p in page["placements"]], list(range(10)))
+            self.assertEqual(result["page_count"], 1)
             for page in result["pages"]:
-                self.assertLessEqual(page["height"], 180)
-                self.assertLessEqual(page["pixels"], 20000)
                 with Image.open(page["path"]) as canvas:
                     for p in page["placements"]:
                         self.assertLessEqual(p["width"], p["source_size"][0])
@@ -325,23 +324,19 @@ class ImagingTests(unittest.TestCase):
                         self.assertEqual(canvas.getpixel((p["x"] + p["width"] - 1, p["y"] + p["height"] - 1)),
                                          (p["index"] * 20, 40, 100))
 
-    def test_later_page_failure_keeps_only_complete_earlier_page(self):
+    def test_single_image_end_failure_has_no_partial_artifact(self):
         from opinion_capture import imaging
         p = self.save("tile.png", Image.new("RGB", (100, 100), "red"))
         out = self.root / "later-failure"
-        original = imaging._save
-        calls = []
-        def interrupted(image, output):
-            calls.append(output)
-            if len(calls) == 2:
-                raise OSError("later page write failed")
-            return original(image, output)
-        with patch("opinion_capture.imaging._save", side_effect=interrupted):
-            with self.assertRaises(OSError):
+        original = imaging._png_chunk
+        def interrupted(stream, kind, payload):
+            if kind == b"IEND":
+                raise OSError("final chunk write failed")
+            return original(stream, kind, payload)
+        with patch("opinion_capture.imaging._png_chunk", side_effect=interrupted):
+            with self.assertRaises(imaging.PageCompositionError):
                 compose_pages([p, p], out, cell_width=100, gap=0, max_pixels=10000)
-        with Image.open(out / "page_01.png") as complete:
-            complete.verify()
-        self.assertFalse((out / "page_02.png").exists())
+        self.assertEqual(list(out.iterdir()), [])
 
 
 if __name__ == "__main__":

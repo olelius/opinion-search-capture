@@ -50,8 +50,38 @@ class ExportPlanTests(unittest.TestCase):
         self.assertEqual(one["raw_paths"], one["originals"])
         self.assertEqual(one["composite_paths"][0]["members"][1]["keyword"], "A10")
         self.assertEqual(one["composition"]["composite_cell_width"], 1080)
-        self.assertEqual(one["composition"]["composite_max_height"], 24000)
+        self.assertTrue(one["composition"]["single_image"])
+        self.assertIsNone(one["composition"]["composite_max_pixels"])
+        self.assertIsNone(one["composition"]["composite_max_height"])
+        group = one["composite_paths"][0]
+        self.assertTrue(group["single_image"])
+        self.assertEqual(group["part"], 1)
+        self.assertNotIn("part_count", group["unresolved_fields"])
+        self.assertFalse(any(w["code"] == "UNKNOWN_PAGE_COUNT" for w in one["warnings"]))
         json.dumps(one, ensure_ascii=False)
+
+    def test_plan_legacy_caps_are_preserved_but_ignored_by_preflight(self):
+        """旧 JSON 的有效数值原样留档；默认无上限，预检始终只报告单张布局。"""
+        defaults = Plan(output_root=str(self.root)).to_dict()
+        self.assertIsNone(defaults["composite_max_pixels"])
+        self.assertIsNone(defaults["composite_max_height"])
+        for layout in ("grid", "horizontal"):
+            baseline = self.check(composite_layout=layout)
+            for pixels, height in ((None, None), (0, 0), (1, 1),
+                                   (50_000_000, 24000), (10**15, 10**12)):
+                with self.subTest(layout=layout, pixels=pixels, height=height):
+                    data = self.plan(composite_layout=layout, composite_max_pixels=pixels,
+                                     composite_max_height=height)
+                    plan = Plan.from_dict(json.loads(json.dumps(data)))
+                    self.assertEqual(plan.to_dict(), data)
+                    report = preflight_plan(plan, planned_at=NOW)
+                    self.assertEqual(report, baseline)
+                    self.assertEqual(report["composition"]["composite_layout"], layout)
+                    self.assertEqual(len(report["composite_paths"]), 1)
+        for field in ("composite_max_pixels", "composite_max_height"):
+            for invalid in (-1, True, "100"):
+                with self.subTest(field=field, invalid=invalid), self.assertRaises(ValueError):
+                    Plan.from_dict(self.plan(**{field: invalid}))
 
     def test_keywords_case_and_illegal_character_disambiguation(self):
         r = self.check(directory_template="档案-{year}-{month:02d}/{keyword}",
@@ -73,12 +103,20 @@ class ExportPlanTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertTrue(any(e["code"] == "PATH_COLLISION" for e in r["errors"]))
 
-    def test_old_template_needs_per_page_id_or_part(self):
-        r = self.check(composite_filename_template="{artifact_id}.png")
-        self.assertTrue(r["ok"], r["errors"])
-        self.assertTrue(r["composite_paths"][0]["requires_unique_id_per_part"])
-        r = self.check(composite_filename_template="汇总.png")
-        self.assertTrue(any(w["code"] == "MULTIPART_COLLISION" for w in r["warnings"]))
+    def test_single_composite_template_keeps_part_one_without_multipart_warning(self):
+        for template in ("{artifact_id}.png", "汇总.png", "汇总-{part:02d}.png"):
+            with self.subTest(template=template):
+                r = self.check(composite_filename_template=template)
+                self.assertTrue(r["ok"], r["errors"])
+                group = r["composite_paths"][0]
+                self.assertEqual(group["part"], 1)
+                self.assertEqual(group["values"]["part"], 1)
+                self.assertNotIn("requires_unique_id_per_part", group)
+                self.assertTrue(r["raw_paths"][0]["requires_unique_id_per_part"])
+                self.assertFalse(any(w["code"] == "MULTIPART_COLLISION" and w.get("kind") == "composite"
+                                     for w in r["warnings"]))
+                if "{part:02d}" in template:
+                    self.assertEqual(Path(group["path"]).name, "汇总-01.png")
 
     def test_cross_year_and_exact_grouping(self):
         r = self.check(directory_template="{month:02d}/{keyword}", filename_template="固定.png")
@@ -113,7 +151,7 @@ class ExportPlanTests(unittest.TestCase):
                         {"filename_template": "{}.png"}, {"filename_template": "{month:99999d}.png"},
                         {"directory_template": "../out"}, {"filename_template": "CON.png"},
                         {"filename_template": "bad?.png"}, {"composite_layout": "diagonal"},
-                        {"composite_max_height": 0}):
+                        {"composite_cell_width": 0}):
             with self.subTest(changes=changes):
                 r = self.check(**changes)
                 self.assertFalse(r["ok"])

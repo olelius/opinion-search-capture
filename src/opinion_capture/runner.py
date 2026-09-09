@@ -347,8 +347,7 @@ def _make_composites(plan, store, batch, results, run_id, callback):
                     try:
                         pages = compose_pages(paths, plan.output_root, members=members,
                             layout=plan.composite_layout, columns=plan.composite_columns,
-                            cell_width=plan.composite_cell_width, max_pixels=plan.composite_max_pixels,
-                            max_height=plan.composite_max_height, output_path_factory=output_factory)
+                            cell_width=plan.composite_cell_width, output_path_factory=output_factory)
                         for page in pages["pages"]:
                             page.update(platform=platform, client=client, capture_kind=kind, actual_date=day,
                                 status="success" if complete else "partial",

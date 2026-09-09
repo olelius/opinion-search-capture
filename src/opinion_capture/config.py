@@ -41,8 +41,9 @@ class Plan:
     composite_columns: int = 4
     composite_cell_width: int = 1080
     composite_layout: str = "grid"
-    composite_max_pixels: int = 50_000_000
-    composite_max_height: int = 24000
+    # 已弃用：仅兼容旧 JSON 并保留快照原值，不作为汇总图的有效上限。
+    composite_max_pixels: int | None = None
+    composite_max_height: int | None = None
     capture_timeout_seconds: int = 180
     max_retries: int = 1
     retry_delay_seconds: float = 2.0
@@ -102,14 +103,17 @@ class Plan:
         if type(self.composite_columns) is not int or not 1 <= self.composite_columns <= 100:
             raise ValueError("拼图列数应为1至100的整数")
         for name, minimum, maximum in (
-            ("composite_cell_width", 64, 4096), ("composite_max_pixels", 100_000, 100_000_000),
-            ("composite_max_height", 256, 100_000), ("capture_timeout_seconds", 1, 1800),
+            ("composite_cell_width", 64, 4096), ("capture_timeout_seconds", 1, 1800),
             ("max_retries", 0, 5), ("schedule_grace_seconds", 0, 3600),
             ("max_queue_delay_seconds", 1, 86400),
         ):
             value = getattr(self, name)
             if type(value) is not int or not minimum <= value <= maximum:
                 raise ValueError(f"{name}应为{minimum}至{maximum}的整数")
+        for name in ("composite_max_pixels", "composite_max_height"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"已弃用字段{name}仅兼容非负整数或null，其值不限制汇总图尺寸")
         if isinstance(self.retry_delay_seconds, bool) or not isinstance(self.retry_delay_seconds, (int, float)) or not 0 <= self.retry_delay_seconds <= 60:
             raise ValueError("重试间隔应为0至60秒")
         if self.composite_layout not in ("grid", "horizontal"):
