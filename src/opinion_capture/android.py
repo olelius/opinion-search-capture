@@ -467,11 +467,14 @@ def _snapshot(adb, directory: Path, result: dict, index: int) -> dict:
 def _loading_hint(xml: str, page: dict) -> str | None:
     """识别加载文字和底部空ImageView候选；仅触发等待，绝不作为到底证据。
 
-    小红书spinner没有文本/资源语义：以底部居中小图且不覆盖内容卡片约束，
+    小红书spinner没有文本/资源语义：要求位于列表独立全宽页脚，且无交互/业务文字，
+    并排除笔记和直播/账号等模块；仅靠底部居中小图会误命中直播观看人数图标。
     坐标按当前内容区缩放，不绑定某个设备的[501,1843][579,1885]。
     """
     from .android_results import bounds
-    nodes = list(ET.fromstring(xml).iter("node"))
+    root = ET.fromstring(xml)
+    nodes = list(root.iter("node"))
+    parents = {child: parent for parent in root.iter() for child in parent}
     for node in nodes:
         if node.get("text", "").strip().rstrip(".。… ") in ("正在加载数据", "正在加载", "加载中", "加载更多"):
             return "loading_text"
@@ -490,8 +493,25 @@ def _loading_hint(xml: str, page: dict) -> str | None:
                 and abs((x1 + x2 - left - right) / 2) <= width * .08
                 and top + height * .8 <= y1 < y2 <= bottom):
             continue
+        regions = [*page.get("items", []), *page.get("excluded", [])]
         if any(x1 < item["bounds"][2] and x2 > item["bounds"][0]
-               and y1 < item["bounds"][3] and y2 > item["bounds"][1] for item in page["items"]):
+               and y1 < item["bounds"][3] and y2 > item["bounds"][1] for item in regions if item.get("bounds")):
+            continue
+        # 找到列表的直接子项；直播卡片即使未计入TOP N，也不具备独立页脚结构。
+        footer = node
+        parent = parents.get(footer)
+        while parent is not None and not parent.get("class", "").endswith("RecyclerView"):
+            footer, parent = parent, parents.get(parent)
+        if parent is None:
+            continue
+        fx1, fy1, fx2, fy2 = bounds(footer)
+        if not (fx1 <= left + width * .05 and fx2 >= right - width * .05
+                and top + height * .8 <= fy1 < fy2 <= bottom
+                and fy2 - fy1 <= height * .2):
+            continue
+        if any(n.get("clickable") == "true" or n.get("long-clickable") == "true"
+               or n.get("text", "").strip() or n.get("content-desc", "").strip()
+               for n in footer.iter("node")):
             continue
         return "bottom_spinner_candidate"
     return None

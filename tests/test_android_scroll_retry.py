@@ -188,7 +188,10 @@ class AndroidScrollRetryTests(unittest.TestCase):
         self.assertEqual(record["touch_cleanup"], "remote_trap_unconfirmed")
 
     def test_spinner_candidate_and_explicit_terminal_are_not_retry_signals(self):
-        spinner = '<hierarchy><node class="android.widget.ImageView" text="" bounds="[501,1843][579,1885]"/></hierarchy>'
+        spinner = ('<hierarchy><node class="androidx.recyclerview.widget.RecyclerView" bounds="[0,42][1080,1920]">'
+                   '<node class="android.widget.FrameLayout" bounds="[0,1808][1080,1920]">'
+                   '<node class="android.widget.ImageView" text="" bounds="[501,1843][579,1885]"/>'
+                   '</node></node></hierarchy>')
         page = dict(platform="xiaohongshu", viewport=[0, 210, 1080, 1920], items=[])
         self.assertEqual(android._loading_hint(spinner, page), "bottom_spinner_candidate")
         self.assertIsNone(android._loading_hint(spinner.replace('text=""', 'text="图标"'), page))
