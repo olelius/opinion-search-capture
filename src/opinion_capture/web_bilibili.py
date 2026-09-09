@@ -21,7 +21,7 @@ from .progress import phase
 
 from .web_results_bilibili import (
     RANK_POLICY, RESULT_SNAPSHOT_JS, PageState, assess_results, collect_results,
-    normalize_snapshot, png_details,
+    identity_order_failures, normalize_snapshot, png_details,
 )
 
 
@@ -49,8 +49,11 @@ def validate_request(request: dict) -> dict:
     timeout = request.get("timeout_seconds", 30)
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout_seconds 必须是有限正数")
+    fresh_search = request.get("fresh_search", False)
+    if type(fresh_search) is not bool:
+        raise ValueError("fresh_search 必须是 bool")
     result = dict(keyword=keyword, capture_kind=kind, top_n=top_n,
-                  timeout_seconds=float(timeout))
+                  timeout_seconds=float(timeout), fresh_search=fresh_search)
     for field in ("output_dir", "user_data_dir", "cancel_file"):
         value = request.get(field)
         if field in ("user_data_dir", "cancel_file") and value is None:
@@ -239,6 +242,13 @@ def suggestion_stability(*scenes: dict) -> dict:
             translations.append({"snapshot": index, "dx": b["x"] - a["x"], "dy": b["y"] - a["y"]})
     return {"verified": not failures, "failures": failures, "group_translations": translations,
             "scope": "keyword_order_visibility_relative_layout_viewport", "document_size_compared": False}
+
+
+def _suggestions_match_keyword(scene: dict, keyword: str) -> bool:
+    """下拉必须绑定当前输入并含本词，旧词联想或空面板不算就绪。"""
+    normalize = lambda value: "".join(value.casefold().split())
+    return (scene.get("input_value") == keyword and bool(scene.get("items"))
+            and any(normalize(keyword) in normalize(item.get("text", "")) for item in scene["items"]))
 
 
 _AUTHENTICATED_NAVIGATION_JS = r"""() => {
@@ -472,12 +482,11 @@ def _capture_worker(payload: dict, *, page=None) -> dict:
             current_url = urlsplit(page.url)
             search_page = (current_url.scheme == "https" and current_url.hostname == "search.bilibili.com"
                            and current_url.path.rstrip("/") == "/all")
-            if search_page:
-                initial = snapshot()
-                evidence["initial_scene"] = initial
-                state, reason = classify_page(initial)
-                if state:
-                    raise PageState(state, reason, initial)
+            initial = snapshot()
+            evidence["initial_scene"] = initial
+            state, reason = classify_page(initial)
+            if state == "blocked" or (search_page and state):
+                raise PageState(state, reason, initial)
             same_keyword = parse_qs(current_url.query).get("keyword") == [req["keyword"]]
             return_to_first = False
             if search_page and same_keyword and req["capture_kind"] == "results":
@@ -488,10 +497,12 @@ def _capture_worker(payload: dict, *, page=None) -> dict:
                                    or any(re.fullmatch(r"[0-9]+", value) and int(value) > 1
                                           for value in page_numbers))
             navigate = not search_page or (req["capture_kind"] == "results"
-                                          and (not same_keyword or return_to_first))
+                                          and (req.get("fresh_search") or not same_keyword or return_to_first))
             evidence["navigation"] = {"from_url": page.url, "action": "goto" if navigate else "reuse"}
             if return_to_first:
                 evidence["navigation"]["reason"] = "return_to_first_page"
+            if req.get("fresh_search") and req["capture_kind"] == "results":
+                evidence["navigation"]["reason"] = "fresh_search"
         if navigate:
             target_url = build_source_url(req["keyword"], req["capture_kind"])
             if borrowed_page:
@@ -505,6 +516,18 @@ def _capture_worker(payload: dict, *, page=None) -> dict:
         if state:
             raise PageState(state, reason, first)
         if borrowed_page and req["capture_kind"] == "results":
+            if first.get("scroll_y", 0) > 1:
+                page.evaluate("window.scrollTo(0,0)")
+                for _ in range(30):
+                    first = snapshot()
+                    state, reason = classify_page(first)
+                    if state:
+                        raise PageState(state, reason, first)
+                    if first.get("scroll_y", 0) <= 1:
+                        break
+                    budget.pause(page, 60)
+                if first.get("scroll_y", 0) > 1:
+                    raise PageState("partial", "search_not_at_top", first)
             # 一次导航后仍不是首页则保留真实状态，不再次导航或冒充全局TOP N。
             page_numbers = parse_qs(urlsplit(first["url"]).query).get("page", [])
             if (first.get("page_number") not in (None, 1)
@@ -513,7 +536,22 @@ def _capture_worker(payload: dict, *, page=None) -> dict:
         box = page.locator("input.search-input-el:visible, input#search-input:visible").first
         box.wait_for(state="visible", timeout=budget(6000))
         if req["capture_kind"] == "suggestions":
-            if borrowed_page and box.input_value(timeout=budget(3000)) == req["keyword"]:
+            if req.get("fresh_search"):
+                evidence["suggestion_input_action"] = "clear_and_refill"
+                box.focus(timeout=budget(2000))
+                box.fill("", timeout=budget(3000))
+                for _ in range(25):
+                    cleared = snapshot()
+                    state, reason = classify_page(cleared)
+                    if state:
+                        raise PageState(state, reason, cleared)
+                    if cleared.get("input_value") == "" and not cleared.get("items"):
+                        break
+                    budget.pause(page, 60)
+                else:
+                    raise PageState("partial", "suggestion_reset_not_confirmed", cleared)
+                box.fill(req["keyword"], timeout=budget(3000))
+            elif borrowed_page and box.input_value(timeout=budget(3000)) == req["keyword"]:
                 evidence["suggestion_input_action"] = "expand_same_value"
                 box.click(timeout=budget(3000))
             else:
@@ -529,10 +567,12 @@ def _capture_worker(payload: dict, *, page=None) -> dict:
             state, reason = classify_page(current)
             if state:
                 raise PageState(state, reason, current)
-            if current["items"] or current.get("no_results"):
+            if ((req["capture_kind"] == "results" and (current["items"] or current.get("no_results")))
+                    or (req["capture_kind"] == "suggestions" and _suggestions_match_keyword(current, req["keyword"]))):
                 break
             budget.pause(page, 200)
-        budget.pause(page, 400)
+        else:
+            raise PageState("partial", "content_load_timeout", current)
         _dismiss_ordinary_tip_once(page, budget, evidence)
         if req["capture_kind"] == "results":
             collected = collect_results(page, req, run, budget, snapshot, classify_page, checkpoint,
@@ -554,10 +594,19 @@ def _capture_worker(payload: dict, *, page=None) -> dict:
         else:
             # 关闭普通弹层若使下拉失焦，正常聚焦一次，不提交搜索、不截断10条合同。
             box.focus(timeout=budget(2000))
-            budget.pause(page, 500)
             before = snapshot()
-            budget.pause(page, 300)
-            settled = snapshot()
+            for _ in range(80):
+                budget.pause(page, 60)
+                settled = snapshot()
+                state, reason = classify_page(settled)
+                if state:
+                    raise PageState(state, reason, settled)
+                if (_suggestions_match_keyword(settled, req["keyword"])
+                        and suggestion_stability(before, settled)["verified"]):
+                    break
+                before = settled
+            else:
+                raise PageState("partial", "suggestions_load_timeout", settled)
             html = run / "suggestions-dom-v1.html"
             with html.open("x", encoding="utf-8") as stream:
                 stream.write(page.content())
@@ -628,6 +677,21 @@ def _capture_worker(payload: dict, *, page=None) -> dict:
             except Exception as diagnostic_error:
                 evidence["diagnostic_error"] = str(diagnostic_error)
     finally:
+        failures = result.get("coverage", {}).get("verification_failures", [])
+        failures = failures + [failure for record in checkpoints for failure in record.get("verification_failures", [])]
+        if req["capture_kind"] == "results":
+            failures = failures + identity_order_failures(evidence.get("blocked_scene", evidence.get("last_scene", {})))
+        reason = result.get("reason", "") + ";" + ";".join(failures)
+        identity_uncertain = (result.get("coverage", {}).get("identity_order_verified") is False
+                              or any(record.get("identity_order_verified") is False for record in checkpoints)
+                              or any(token in reason for token in (
+                                  "unknown_card:", "card_id_missing:", "card_title_missing:", "card_css_order_unverified:",
+                                  "identity_or_order_changed", "pagination_no_new_identity")))
+        result["retryable"] = (result["status"] in ("failed", "partial") and not identity_uncertain
+                               and (result["outcome"] == "timeout" or any(token in reason for token in (
+                                   "TimeoutError", "ConnectionError", "load_timeout", "results_not_loaded", "loading_stalled",
+                                   "page_kept_changing",
+                                   "no_growth_without_explicit_end_or_next", "pagination_not_confirmed"))))
         if borrowed_page and response_listener is not None:
             try:
                 # 只移除本次监听，不清空调用方订阅，不修改其默认timeout。

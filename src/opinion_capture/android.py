@@ -22,10 +22,15 @@ from .progress import phase
 
 PACKAGES = {"xiaohongshu": "com.xingin.xhs", "bilibili": "tv.danmaku.bili"}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+LOADING_WAIT_SECONDS = 25.0
 
 
 class AndroidCancelled(RuntimeError):
     """主runner取消标记已出现；不继续发出设备命令。"""
+
+
+class AndroidLoadingTimeout(RuntimeError):
+    """本次加载预算耗尽，供调度器使用新attempt从头重搜。"""
 
 
 def _check(deadline: float, cancel_file: str | None = None) -> None:
@@ -34,6 +39,15 @@ def _check(deadline: float, cancel_file: str | None = None) -> None:
         raise AndroidCancelled("cancel_requested")
     if time.monotonic() >= deadline:
         raise TimeoutError("capture_deadline_exceeded")
+
+
+def _sleep_checked(seconds: float, deadline: float, cancel_file: str | None = None) -> None:
+    """短片等待中每50ms检查取消；不越过手势/加载/整次采集截止时间。"""
+    until = min(deadline, time.monotonic() + max(0, seconds))
+    while time.monotonic() < until:
+        _check(deadline, cancel_file)
+        time.sleep(max(0, min(.05, until - time.monotonic())))
+    _check(deadline, cancel_file)
 
 
 def _run_bounded(command, deadline, cancel_file=None, env=None):
@@ -132,6 +146,12 @@ class AdbClient:
     def text(self, *args: str, device: bool = True) -> str:
         """只对命令文本输出执行 UTF-8 解码。"""
         return self.run(*args, device=device).decode("utf-8", "replace").strip()
+
+    def drag_hold(self, gesture: dict) -> None:
+        """单条ADB shell通道完成手势；设备端cmd input不启动逐点Python/RPC。"""
+        output = self.run("shell", _drag_hold_script(gesture))
+        if not output.rstrip().endswith(b"gesture_completed"):
+            raise AndroidBlocked("gesture_completion_not_confirmed")
 
     def list_devices(self, serial: str | None = None, *, refresh: bool = False) -> list[dict]:
         """已连接设备直接复用；刷新或目标缺失时仅连接管理器报告的运行实例。"""
@@ -249,6 +269,7 @@ def _ui_call(serial: str, deadline: float, action: str, cancel_file: str | None 
         command,
         deadline, cancel_file, env=env,
     )
+    _check(deadline, cancel_file)
     if output.returncode:
         raise RuntimeError("ui_worker_failed: " + output.stderr.decode("utf-8", "replace")[-500:])
     response = json.loads(output.stdout.decode("utf-8"))
@@ -400,6 +421,7 @@ def _snapshot(adb, directory: Path, result: dict, index: int) -> dict:
     """保存XML前后快照与原始ADB PNG，并验证内容签名未跨截图改变。"""
     import hashlib
     from .android_results import parse_page, page_signature
+    started = time.monotonic()
     prefix = directory / "source" / f"frame-{index:03d}"
     prefix.parent.mkdir(exist_ok=True)
     paths = {}
@@ -421,12 +443,15 @@ def _snapshot(adb, directory: Path, result: dict, index: int) -> dict:
     before = parse_page(paths["before_xml"], result["platform"], result["capture_kind"], result["keyword"])
     after = parse_page(paths["after_xml"], result["platform"], result["capture_kind"], result["keyword"])
     stable = page_signature(before) == page_signature(after)
-    transient = any(word in paths["before_xml"] or word in paths["after_xml"] for word in ("下拉支持刷新内容", "正在加载数据"))
+    # 加载文字只作loading_hint；页底仍在加载不代表当前TOP N内容不稳定。
+    transient = any("下拉支持刷新内容" in xml for xml in (paths["before_xml"], paths["after_xml"]))
     stable = stable and not transient
     frame = dict(png_path=paths["png"], xml_path=paths["before"], after_xml_path=paths["after"],
                  png_sha256=hashlib.sha256(Path(paths["png"]).read_bytes()).hexdigest(),
                  xml_sha256=hashlib.sha256(Path(paths["before"]).read_bytes()).hexdigest(),
-                 stable=stable, page=before, source_index=index, accepted=False,
+                  stable=stable, page=before, source_index=index, accepted=False,
+                  loading_hint=_loading_hint(paths["after_xml"], after) or _loading_hint(paths["before_xml"], before),
+                  snapshot_seconds=round(time.monotonic() - started, 3),
                  captured_at=datetime.now().astimezone().isoformat())
     result["frames"].append(frame)
     result["captured_at"] = frame["captured_at"]
@@ -437,6 +462,108 @@ def _snapshot(adb, directory: Path, result: dict, index: int) -> dict:
     if blocker and not (blocker == "login_required" and result["capture_kind"] == "suggestions" and before["recognized"]):
         raise AndroidBlocked(blocker)
     return frame
+
+
+def _loading_hint(xml: str, page: dict) -> str | None:
+    """识别加载文字和底部空ImageView候选；仅触发等待，绝不作为到底证据。
+
+    小红书spinner没有文本/资源语义：以底部居中小图且不覆盖内容卡片约束，
+    坐标按当前内容区缩放，不绑定某个设备的[501,1843][579,1885]。
+    """
+    from .android_results import bounds
+    nodes = list(ET.fromstring(xml).iter("node"))
+    for node in nodes:
+        if node.get("text", "").strip().rstrip(".。… ") in ("正在加载数据", "正在加载", "加载中", "加载更多"):
+            return "loading_text"
+        if node.get("class", "").endswith("ProgressBar"):
+            return "progress_bar"
+    if page.get("platform") != "xiaohongshu":
+        return None
+    left, top, right, bottom = page["viewport"]
+    width, height = right - left, bottom - top
+    for node in nodes:
+        if (node.get("class") != "android.widget.ImageView" or node.get("text", "").strip()
+                or node.get("content-desc", "").strip() or node.get("clickable") == "true"):
+            continue
+        x1, y1, x2, y2 = bounds(node)
+        if not (0 < x2 - x1 <= width * .12 and 0 < y2 - y1 <= height * .08
+                and abs((x1 + x2 - left - right) / 2) <= width * .08
+                and top + height * .8 <= y1 < y2 <= bottom):
+            continue
+        if any(x1 < item["bounds"][2] and x2 > item["bounds"][0]
+               and y1 < item["bounds"][3] and y2 > item["bounds"][1] for item in page["items"]):
+            continue
+        return "bottom_spinner_candidate"
+    return None
+
+
+def _wait_for_ready(adb, directory: Path, result: dict, frame: dict, reason: str, accept) -> dict:
+    """共享25秒累计加载预算；XML就绪才取证，封面则允许XML不变时重取PNG。
+
+    accept须原子验证候选帧（失败时不推进ledger）。等待只读取本地设备状态，
+    不重搜、不滑动；临时缩短ADB截止时间，使RPC和截图也计入同一预算。
+    """
+    from .android_results import EvidenceError, parse_page, page_signature
+    budget = result.setdefault("loading_wait", dict(budget_seconds=LOADING_WAIT_SECONDS, elapsed_seconds=0.0, episodes=[]))
+    started, original_deadline = time.monotonic(), adb.deadline
+    available = max(0, budget["budget_seconds"] - budget["elapsed_seconds"])
+    adb.deadline = min(original_deadline, started + available)
+    event = dict(reason=reason, from_frame=frame.get("source_index"), status="waiting", probes=0, snapshots=0)
+    budget["episodes"].append(event)
+    signature = page_signature(frame["page"])
+    try:
+        while True:
+            _check(adb.deadline, adb.cancel_file)
+            phase("loading_wait", f"APP原地等待加载：{reason}；累计{budget['elapsed_seconds'] + time.monotonic() - started:.1f}/{budget['budget_seconds']:.0f}秒")
+            xml = _dump(adb)
+            event["probes"] += 1
+            blocker = detect_blocker(xml)
+            if blocker:
+                raise AndroidBlocked(blocker)
+            page = parse_page(xml, result["platform"], result["capture_kind"], result["keyword"])
+            if not page["viewport"][2]:
+                raise AndroidBlocked("foreground_app_changed")
+            hint = _loading_hint(xml, page)
+            changed = page_signature(page) != signature
+            # 新卡出现即重新验证目标，不等待footer spinner消失；无新增时不空滑。
+            # 封面/动画可能只改变PNG，仍允许原地取证；加载指示消失也复核一次。
+            if (changed or reason in ("cover_content_unverified", "page_kept_changing_during_screenshot")
+                    or (not hint and reason == "loading_indicator_visible")):
+                candidate = _snapshot(adb, directory, result, len(result["frames"]))
+                event["snapshots"] += 1
+                try:
+                    accept(candidate)
+                except EvidenceError as exc:
+                    reason = str(exc)
+                    candidate["rejection_reason"] = reason
+                    if reason not in _WAITABLE_REASONS:
+                        raise
+                    signature = page_signature(candidate["page"])
+                else:
+                    _check(adb.deadline, adb.cancel_file)
+                    event.update(status="ready", ready_frame=candidate.get("source_index"))
+                    return candidate
+            _sleep_checked(.35, adb.deadline, adb.cancel_file)
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        event["status"] = "timeout"
+        failure = {"cover_content_unverified": "cover_loading_not_confirmed_within_budget",
+                   "no_scroll_progress": "scroll_stalled_without_verified_end"}.get(reason, "loading_not_confirmed_within_budget")
+        raise AndroidLoadingTimeout(failure) from exc
+    except AndroidCancelled:
+        event["status"] = "cancelled"
+        raise
+    except Exception:
+        event["status"] = "interrupted"
+        raise
+    finally:
+        event.update(last_reason=reason, elapsed_seconds=round(time.monotonic() - started, 3))
+        budget["elapsed_seconds"] += time.monotonic() - started
+        adb.deadline = original_deadline
+        phase("loading_wait", f"APP加载等待{event['status']}：本段{event['elapsed_seconds']:.3f}秒，累计{budget['elapsed_seconds']:.3f}秒")
+
+
+_WAITABLE_REASONS = {"cover_content_unverified", "no_scroll_progress", "loading_indicator_visible",
+                     "page_kept_changing_during_screenshot"}
 
 
 def _suggestions(frame: dict, directory: Path, result: dict) -> None:
@@ -471,6 +598,29 @@ def _suggestions(frame: dict, directory: Path, result: dict) -> None:
                   rank_verified=True, outcome="complete")
 
 
+def _drag_hold_script(gesture: dict) -> str:
+    """生成单通道设备端触控脚本；先检查motionevent支持，再DOWN/减速MOVE/停留/UP。
+
+    使用Android现有cmd input服务，不经失败的UI多点RPC，也不安装辅助程序。
+    每段sleep是最低间隔（命令开销另计）；最后180ms持续同点MOVE抑制释放惯性。
+    非零退出/断开时trap发送CANCEL；任何异常均不重放手势。
+    """
+    x, y = gesture["start"]
+    ex, ey = gesture["end"]
+    event = "cmd input touchscreen motionevent"
+    commands = ["set -e", "case \"$(cmd input help 2>&1)\" in *motionevent*) ;; *) echo motionevent_unsupported >&2; exit 64 ;; esac",
+                f"trap '{event} CANCEL >/dev/null 2>&1' EXIT", "trap 'exit 130' HUP INT TERM",
+                f"{event} DOWN {int(x)} {int(y)}"]
+    for index in range(1, gesture["move_steps"] + 1):
+        eased = 1 - (1 - index / gesture["move_steps"]) ** 3
+        commands.extend((f"sleep {gesture['move_duration_ms'] / gesture['move_steps'] / 1000:.3f}",
+                         f"{event} MOVE {round(x + (ex - x) * eased)} {round(y + (ey - y) * eased)}"))
+    for _ in range(3):
+        commands.extend((f"sleep {gesture['end_hold_ms'] / 3000:.3f}", f"{event} MOVE {int(ex)} {int(ey)}"))
+    commands.extend((f"{event} UP {int(ex)} {int(ey)}", "trap - EXIT", "echo gesture_completed"))
+    return "; ".join(commands)
+
+
 def _swipe_forward(adb, page: dict, *, cautious: bool = False, remaining: int | None = None,
                    record: dict | None = None) -> dict:
     """在已确认可见内容区拖动，避开小红书底部提示和双列间隙。
@@ -496,23 +646,32 @@ def _swipe_forward(adb, page: dict, *, cautious: bool = False, remaining: int | 
         delta = max(1, round(normal_delta * max(1, remaining) / max(2, visible_count)))
     y = top + round(height * .9)
     end_y = y - delta
-    # 快速释放可让内容移动超过手势距离；复用原ADB通道，按距离延长时长而非缩短行程。
-    # 450px/s是保守导航速度，不是实际位移保证；仍由下一帧验证内容位移和覆盖。
-    duration_ms = max(600, math.ceil(delta * 1000 / 450))
+    # 不用高速input swipe直接抬手：末端静止MOVE后才UP，行程仍为内容区80%。
+    move_ms, hold_ms = (400 if cautious else 320), 180
+    duration_ms = move_ms + hold_ms
     action = record if record is not None else {}
     action.update({"start": [x, y], "end": [x, end_y], "cautious": cautious,
             "viewport": list(page["viewport"]), "normal_target_px": normal_delta,
             "target_px": delta, "target_ratio": delta / height,
             "expected_overlap_ratio": 1 - delta / height,
             "remaining": remaining, "boundary_limited": boundary_limited,
-            "gesture": "adb_distance_scaled_swipe", "duration_ms": duration_ms,
-            "nominal_speed_px_s": delta * 1000 / duration_ms, "dispatch_status": "planned"})
+            "gesture": "adb_single_shell_motionevent_end_hold", "duration_ms": duration_ms,
+            "move_duration_ms": move_ms, "end_hold_ms": hold_ms, "move_steps": 8,
+            "nominal_speed_px_s": delta * 1000 / move_ms, "dispatch_status": "planned"})
+    started = time.monotonic()
+    phase("scroll", f"APP受控快速滚动：目标{delta}px，移动{move_ms}ms＋末端停留{hold_ms}ms")
     try:
-        adb.run("shell", "input", "swipe", str(x), str(y), str(x), str(end_y), str(duration_ms))
+        adb.drag_hold(action)
     except Exception:
         action["dispatch_status"] = "interrupted_or_unknown"
+        # 远端EXIT/HUP trap负责CANCEL；连接中断后其结果未知，不宣称已释放触点。
+        action["touch_cleanup"] = "remote_trap_unconfirmed"
         raise
-    action["dispatch_status"] = "command_completed"
+    else:
+        action["dispatch_status"] = "command_completed"
+    finally:
+        action["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        phase("scroll", f"APP滚动{action['dispatch_status']}：动作耗时{action['elapsed_seconds']:.3f}秒")
     return action
 
 
@@ -544,59 +703,67 @@ def _collect(adb, directory: Path, result: dict, request: dict) -> None:
     strict = request.get("capture_mode", "visual_scrollshot") == "strict_evidence"
     ledger = RankLedger(result["requested_top_n"], strict=strict)
     check = lambda: _check(adb.deadline, adb.cancel_file)
-    result.update(status="partial", reason="capture_started", observed_count=0)
-    stable_retries = 0
+    result.update(status="partial", reason="capture_started", observed_count=0, retryable=False)
     pixel_retries = 0
-    stationary_attempts = 0
-    cover_waits = 0
     last_scroll = None
+
+    def accept(frame):
+        """就绪和证据校验成功后才原子推进本次独立ledger。"""
+        if not frame["stable"]:
+            raise EvidenceError("page_kept_changing_during_screenshot")
+        if result["capture_kind"] == "suggestions":
+            if frame.get("loading_hint") and not frame["page"].get("end_marker"):
+                raise EvidenceError("loading_indicator_visible")
+            return
+        _check_visible_covers(frame, check)
+        # RankLedger.add内部采用写时复制；这里把add后的加载/目标判断也纳入事务，
+        # 否则“已收帧但目标尚缺、继续等待”会污染下一次候选帧的参考ledger。
+        previous = (ledger.items, ledger.excluded, ledger.unknown, ledger.frames, ledger.links)
+        frame_state = {key: (key in frame, frame.get(key)) for key in ("offset", "accepted")}
+        try:
+            ledger.add(frame, check)
+            count = min(len(ledger.items), ledger.top_n)
+            if (frame.get("loading_hint") and not ledger.target_ready()
+                    and not (frame["page"].get("end_marker") and ledger.boundary_clear(count))):
+                raise EvidenceError("loading_indicator_visible")
+            check()
+        except BaseException as exc:
+            ledger.items, ledger.excluded, ledger.unknown, ledger.frames, ledger.links = previous
+            for key, (existed, value) in frame_state.items():
+                if existed:
+                    frame[key] = value
+                else:
+                    frame.pop(key, None)
+            if isinstance(exc, EvidenceError) and str(exc) == "no_scroll_progress" and frame["page"].get("end_marker"):
+                # 已看到明确终点但未建立像素链接：保留缺证失败，不把它当加载重试。
+                raise EvidenceError("explicit_end_without_verified_boundary") from exc
+            if isinstance(exc, EvidenceError) and str(exc) == "no_scroll_progress" and frame.get("loading_hint"):
+                raise EvidenceError("loading_indicator_visible") from exc
+            raise
+
     try:
         for _ in range(request.get("max_frames", 80)):
             check()
             phase("screenshot", f"APP原始截图与控件快照：第{len(result['frames']) + 1}帧")
             frame = _snapshot(adb, directory, result, len(result["frames"]))
-            if not frame["stable"]:
-                stable_retries += 1
-                if stable_retries >= 3:
-                    raise EvidenceError("page_kept_changing_during_screenshot")
-                time.sleep(min(.5, max(0, adb.deadline - time.monotonic())))
-                continue
-            stable_retries = 0
             phase("validate_capture", f"APP内容与连续性校验：已确认{len(ledger.items)}条")
+            try:
+                accept(frame)
+            except EvidenceError as exc:
+                frame["rejection_reason"] = str(exc)
+                if str(exc) in _WAITABLE_REASONS:
+                    frame = _wait_for_ready(adb, directory, result, frame, str(exc), accept)
+                # 瞬时提示/封面迟到先保存问题源帧，再原地等待一次；不继续滚动掩盖缝隙。
+                elif str(exc).startswith("pixel_overlap_mismatch") and pixel_retries < 2:
+                    pixel_retries += 1
+                    _sleep_checked(1, adb.deadline, adb.cancel_file)
+                    continue
+                else:
+                    raise
             if result["capture_kind"] == "suggestions":
                 _suggestions(frame, directory, result)
                 return
-            try:
-                # 视觉拼接也须等待完整封面加载；XML稳定本身不足以排除实拍中的白色占位。
-                _check_visible_covers(frame, check)
-                ledger.add(frame, check)
-            except EvidenceError as exc:
-                frame["rejection_reason"] = str(exc)
-                if str(exc) == "cover_content_unverified":
-                    cover_waits += 1
-                    if cover_waits > 2:
-                        raise EvidenceError("cover_loading_not_confirmed_within_budget") from exc
-                    # 原地等两次，不滚动越过缺图，也不放宽重复身份的原始封面hash验证。
-                    time.sleep(min(1, max(0, adb.deadline - time.monotonic())))
-                    continue
-                if str(exc) == "no_scroll_progress":
-                    stationary_attempts += 1
-                    if stationary_attempts > 2:
-                        raise EvidenceError("scroll_stalled_without_verified_end") from exc
-                    # 提示消失可能消耗一次手势；不把重复帧加进排名，不以静止判到底。
-                    last_scroll = _swipe_forward(adb, frame["page"], cautious=True,
-                        remaining=max(0, ledger.top_n - len(ledger.items)), record=frame.setdefault("next_scroll", {}))
-                    time.sleep(min(.6, max(0, adb.deadline - time.monotonic())))
-                    continue
-                # 瞬时提示/封面迟到先保存问题源帧，再原地等待一次；不继续滚动掩盖缝隙。
-                if str(exc).startswith("pixel_overlap_mismatch") and pixel_retries < 2:
-                    pixel_retries += 1
-                    time.sleep(min(1, max(0, adb.deadline - time.monotonic())))
-                    continue
-                raise
             pixel_retries = 0
-            stationary_attempts = 0
-            cover_waits = 0
             if len(ledger.frames) > 1:
                 previous, link = ledger.frames[-2], ledger.links[-1]
                 source_height = previous["page"]["viewport"][3] - previous["page"]["viewport"][1]
@@ -635,7 +802,6 @@ def _collect(adb, directory: Path, result: dict, request: dict) -> None:
             # 80%是手势目标而非位移证据；接近目标缩短，下一帧仍验证实际重叠与排名。
             last_scroll = _swipe_forward(adb, frame["page"], remaining=max(0, ledger.top_n - len(ledger.items)),
                 record=frame.setdefault("next_scroll", {}))
-            time.sleep(min(.6, max(0, adb.deadline - time.monotonic())))
         raise EvidenceError("max_frames_reached_without_verified_boundary")
     finally:
         if result["capture_kind"] == "results":
@@ -655,6 +821,7 @@ def capture(request: dict) -> dict:
         "platform": request.get("platform"), "client": "APP",
         "capture_kind": request.get("capture_kind"), "keyword": request.get("keyword"),
         "status": "failed", "reason": "", "requested_top_n": request.get("top_n", 20),
+        "retryable": False,
         "observed_count": None, "rank_verified": False, "artifact_paths": [],
         "primary_artifact_path": None, "source_artifact_paths": [], "items": [], "frames": [],
         "rank_policy": "independent_content_cards", "rank_order": "visible_top_y_then_x",
@@ -707,10 +874,12 @@ def capture(request: dict) -> dict:
         _check(deadline, cancel_file)
     except AndroidCancelled as exc:
         result.update(status="cancelled", reason=str(exc), rank_verified=False, primary_artifact_path=None)
+    except AndroidLoadingTimeout as exc:
+        result.update(status="failed", reason=str(exc), retryable=True, rank_verified=False, primary_artifact_path=None)
     except AndroidBlocked as exc:
         result.update(status="partial" if str(exc) == "network_unavailable" else "blocked", reason=str(exc), rank_verified=False)
     except (TimeoutError, subprocess.TimeoutExpired) as exc:
-        result.update(status="partial", reason="capture_timeout: " + str(exc)[:200], rank_verified=False)
+        result.update(status="partial", reason="capture_timeout: " + str(exc)[:200], rank_verified=False, retryable=True)
     except Exception as exc:
         from .android_results import EvidenceError
         result.update(status="partial" if isinstance(exc, EvidenceError) or result["source_artifact_paths"] else "failed", reason=f"{type(exc).__name__}: {exc}", rank_verified=False)

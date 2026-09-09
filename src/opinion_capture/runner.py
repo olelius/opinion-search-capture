@@ -210,6 +210,23 @@ def _export_primary(plan: Plan, store: Store, batch: dict, task: dict, attempt: 
     result["exports"], result["primary_artifact_path"] = [item], str(source)
 
 
+def _retry_allowed(result: dict) -> bool:
+    """仅对暂时采集故障重新搜索；终态、认证阻断和证据规则问题不盲重试。"""
+    if result.get("status") not in ("failed", "partial"):
+        return False
+    if "retryable" in result:
+        return result["retryable"] is True
+    if result.get("outcome") == "timeout":
+        return True
+    reason = str(result.get("reason", "")).lower()
+    return any(token in reason for token in (
+        "timeouterror", "connectionerror", "connection_error", "remote disconnected",
+        "capture_timeout", "browser_response_timeout", "capture_deadline_exceeded", "capture_total_deadline_exceeded",
+        "loading_timeout", "scroll_stalled_without", "cover_loading_not_confirmed_within_budget",
+        "page_kept_changing_during_screenshot",
+    ))
+
+
 def _run_task(plan, store, batch, task, cancel_event, callback, completed, total, collector):
     base = _base_result(task, plan)
     for retry in range(plan.max_retries + 1):
@@ -221,6 +238,8 @@ def _run_task(plan, store, batch, task, cancel_event, callback, completed, total
         request = {k: task[k] for k in ("platform", "client", "capture_kind", "keyword")} | {
             "top_n": plan.top_n, "rank_policy": plan.rank_policy, "capture_mode": plan.capture_mode,
             "batch_id": batch["id"],
+            "attempt_number": attempt["number"], "retry_number": retry,
+            "fresh_search": attempt["number"] > 1,
             "output_dir": str(workdir), "timeout_seconds": plan.capture_timeout_seconds,
             "cancel_file": str(workdir / "cancel.request"), "phase_file":str(workdir / "phase.json")}
         if plan.android_serial:
@@ -263,22 +282,31 @@ def _run_task(plan, store, batch, task, cancel_event, callback, completed, total
             _export_primary(plan, store, batch, task, attempt, workdir, result, actual)
             result["has_deliverable"] = bool(result.get("exports"))
             if result["status"] == "partial" and not result["has_deliverable"]:
-                result.update(status="failed", outcome="incomplete", retryable=False,
+                result.update(status="failed", outcome=result.get("outcome") or "incomplete",
                               completion_detail="未产生最终截图，保留诊断证据")
-            retryable = result["status"] == "failed" and result.get("retryable", True)
+            retryable = _retry_allowed(result)
         except ResourceBusy as exc:
             result = base | {"status": "cancelled" if cancel_event.is_set() else "blocked",
                              "reason": str(exc), "captured_at": datetime.now(TIMEZONE).isoformat()}
         except Exception as exc:
             result = base | {"status": "cancelled" if cancel_event.is_set() else "failed",
                              "reason": f"{type(exc).__name__}: {exc}", "captured_at": datetime.now(TIMEZONE).isoformat()}
-            retryable = isinstance(exc, (TimeoutError, ConnectionError))
+            retryable = not cancel_event.is_set() and isinstance(exc, (TimeoutError, ConnectionError))
         result["attempt_id"] = attempt["id"]
+        scheduled_retry = retryable and retry < plan.max_retries and not cancel_event.is_set()
+        result.update(attempt_number=attempt["number"], retry_number=retry,
+                      fresh_search=request["fresh_search"], retryable=retryable,
+                      retry_scheduled=scheduled_retry,
+                      retry_exhausted=retryable and retry >= plan.max_retries,
+                      retry_scope="same_keyword_from_start")
         _write_json(workdir / "attempt-summary.json", result)
         store.complete_attempt(attempt["id"], task["id"], result)
-        if retryable and retry < plan.max_retries and not cancel_event.is_set():
+        if scheduled_retry:
             _emit(callback, "task_retry", batch_id=batch["id"], task_id=task["id"],
-                  completed=completed, total=total, status="retrying", reason=result["reason"])
+                  completed=completed, total=total, status="retrying", reason=result["reason"],
+                  keyword=task["keyword"], attempt=attempt["number"] + 1,
+                  retry_number=retry + 1, max_retries=plan.max_retries,
+                  retry_scope="same_keyword_from_start")
             cancel_event.wait(plan.retry_delay_seconds)
             continue
         return result

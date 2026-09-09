@@ -22,7 +22,8 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from uuid import uuid4
 
 from .web_results_xiaohongshu import (
-    RANK_POLICY, RANK_POLICY_DETAIL, SCROLL_JS, SCROLL_TOP_JS, SNAPSHOT_JS, analyse_frames, fingerprint,
+    RANK_POLICY, RANK_POLICY_DETAIL, SCROLL_JS, SCROLL_TOP_JS, SNAPSHOT_JS,
+    analyse_frames, fingerprint, note_identity,
 )
 from .web_fullpage import FullPageNotReady, crop_top_n, file_sha256, fullpage_readiness
 from .progress import phase
@@ -56,7 +57,11 @@ def validate_request(request: dict) -> dict:
     timeout = request.get("timeout_seconds", 180)
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 1800:
         raise ValueError("timeout_seconds 必须在 (0, 1800] 范围")
-    result = dict(keyword=keyword.strip(), capture_kind=kind, top_n=top_n, timeout_seconds=float(timeout))
+    fresh_search = request.get("fresh_search", False)
+    if type(fresh_search) is not bool:
+        raise ValueError("fresh_search 必须是 bool")
+    result = dict(keyword=keyword.strip(), capture_kind=kind, top_n=top_n,
+                  timeout_seconds=float(timeout), fresh_search=fresh_search)
     for key in ("output_dir", "user_data_dir", "cancel_file"):
         value = request.get(key)
         if key != "output_dir" and value is None:
@@ -195,6 +200,22 @@ def _checkpoint(run: Path, result: dict, evidence: dict) -> None:
     if path not in result["artifact_paths"]:
         result["artifact_paths"].append(path)
     result["finished_at"] = _now()
+    # 身份/顺序不明优先保留证据，不因伴随超时或停滞而盲目重搜。
+    issues = result.get("issues", [])
+    scenes = [evidence.get("prepared_snapshot", {})]
+    if not evidence.get("fresh_search_navigation"):
+        scenes.append(evidence.get("initial_snapshot", {}))
+    scenes.extend(frame.get("after", {}) for frame in evidence.get("frames", []))
+    identity_uncertain = result.get("capture_kind") == "results" and any(
+        item.get("identity_error") or not note_identity(item)
+        for scene in scenes for item in scene.get("results", []) if not item.get("excluded"))
+    transient = {"target_images_or_screenshot_coverage_incomplete", "dom_changed_during_screenshot"}
+    reason = result.get("reason", "") + ";" + result.get("stop_reason", "")
+    result["retryable"] = (result.get("status") in ("failed", "partial")
+                           and not identity_uncertain and not any(issue not in transient for issue in issues)
+                           and (result.get("outcome") == "timeout" or any(token in reason for token in (
+                               "TimeoutError", "ConnectionError", "load_timeout", "scroll_stalled", "frame_budget_exceeded",
+                               "suggestions_not_observed", "waiting_for_results_or_explicit_end"))))
     _write_json(Path(path), {"schema_version": 2, "result": result, "evidence": evidence})
 
 
@@ -307,15 +328,21 @@ def _settled(page, request: dict, budget: Budget, http_status=None) -> dict:
         state = _snapshot(page, budget, http_status)
         if _block(state):
             return state
-        present = bool(state.get(request["capture_kind"])) or state.get("explicit_end")
+        present = bool(state.get(request["capture_kind"])) or (request["capture_kind"] == "results" and state.get("explicit_end"))
         pending = state.get("suggestion_pending_images", 0) if request["capture_kind"] == "suggestions" else state.get("pending_images")
         bound = request["capture_kind"] != "suggestions" or not _source_problem(state, request)
+        if request["capture_kind"] == "suggestions" and request.get("fresh_search"):
+            normalize = lambda value: "".join(unicodedata.normalize("NFKC", value).casefold().split())
+            bound = (bound and state.get("suggestion_panel_associated") and state.get("suggestion_panel_rect")
+                     and any(normalize(request["keyword"]) in normalize(item.get("text", ""))
+                             for item in state.get("suggestions", [])))
         if present and bound and not state.get("loading") and not pending and previous == fingerprint(state):
             return state
         if time.monotonic() >= until:
+            state["wait_reason"] = "content_load_timeout"
             return state
         previous = fingerprint(state)
-        budget.pause(180)
+        budget.pause(60)
 
 
 def _save_frame(page, run: Path, frames: list, request: dict, budget: Budget, http_status=None) -> dict:
@@ -404,7 +431,7 @@ def _next_scroll_step(state: dict, analysis: dict, top_n: int) -> float:
     """正常保留重叠；接近第N条时只滚到缺失底边，避免触发多余的下一页加载。"""
     scroll = state.get("scroll", {})
     visible_height = scroll.get("viewport_height", state.get("viewport", {}).get("height", 1080))
-    step = max(1, visible_height * .55)
+    step = max(1, visible_height * .8)
     targets = [item for item in analysis.get("items", []) if item.get("counted")]
     if len(targets) < top_n:
         return step
@@ -432,6 +459,10 @@ def _collect(page, request: dict, run: Path, result: dict, evidence: dict, budge
             result.update(status="blocked", reason=_block(settled), rank_verified=False, observed_count=None, outcome="blocked")
             evidence["blocked_snapshot"] = settled
             _checkpoint(run, result, evidence)
+            break
+        if settled.get("wait_reason"):
+            stop_reason = settled["wait_reason"]
+            break
         frame = _save_frame(page, run, frames, request, budget, evidence.get("http_status"))
         result["source_artifact_paths"].append(frame["path"])
         result["artifact_paths"].extend([frame["path"], frame["html_path"]])
@@ -461,11 +492,16 @@ def _collect(page, request: dict, run: Path, result: dict, evidence: dict, budge
         frame["next_scroll_step"] = step
         if step > 0:
             page.evaluate(SCROLL_JS, step)
-        budget.pause(250)
     else:
         stop_reason = "frame_budget_exceeded"
     if stop_reason:
-        result.update(_evaluate(frames, request, stop_reason))
+        if frames:
+            result.update(_evaluate(frames, request, stop_reason))
+        else:
+            result.update(status="partial", reason=stop_reason, outcome="incomplete", rank_verified=False)
+        if stop_reason not in result["reason"]:
+            result["reason"] += ";" + stop_reason
+        result["stop_reason"] = stop_reason
         evidence["stop_reason"] = stop_reason
     target_scene = any(frame["after"].get(request["capture_kind"]) or
                        (request["capture_kind"] == "results" and frame["after"].get("explicit_end")) for frame in frames)
@@ -782,16 +818,18 @@ def _input_control(page, state):
 
 
 def _prepare_current_page(page, request: dict, evidence: dict, budget: Budget, page_ref=None) -> dict:
-    """复用调用方选好的页面：同词结果零导航；异词最多一次搜索导航/输入。"""
+    """首轮同词零导航；结果重试仅一次传统URL导航，下拉重试只清空重填。"""
     phase("prepare_search", "定位搜索框与当前关键词")
     state = _snapshot(page, budget)
     evidence["initial_snapshot"] = state
+    fresh = request.get("fresh_search", False)
+    search_url = "https://www.xiaohongshu.com/search_result?" + urlencode({
+        "keyword": quote(request["keyword"], safe=""), "source": "web_explore_feed"})
     if state.get("url") == "about:blank":
         # 连接层只会为缺失的平台新建空标签页；一次进入目标页，不另开浏览器。
         url = "https://www.xiaohongshu.com/explore"
-        if request["capture_kind"] == "suggestions":
-            url = "https://www.xiaohongshu.com/search_result?" + urlencode({
-                "keyword": quote(request["keyword"], safe=""), "source": "web_explore_feed"})
+        if request["capture_kind"] == "suggestions" or fresh:
+            url = search_url
         evidence.update(navigation_attempts=1, requested_url=url)
         response = page.goto(url, wait_until="domcontentloaded", timeout=budget.check(30_000))
         budget.check()
@@ -809,9 +847,22 @@ def _prepare_current_page(page, request: dict, evidence: dict, budget: Budget, p
         evidence["preparation_problem"] = "unexpected_source_url"
         return state
     if request["capture_kind"] == "results":
+        if fresh:
+            # goto即使URL相同也重新载入文档；不依赖同路由可能被忽略的Enter提交。
+            if not evidence.get("navigation_attempts"):
+                response = page.goto(search_url, wait_until="domcontentloaded", timeout=budget.check(30_000))
+                evidence.update(navigation_attempts=1, requested_url=search_url,
+                                http_status=response.status if response else None)
+            evidence["fresh_search_navigation"] = True
+            state = _snapshot(page, budget, evidence.get("http_status"))
+            if _block(state):
+                return state
         # URL 与输入框都绑定本词才复用；二次 URL 编码沿用既有校验。
         problem = _source_problem(state, request, require_input_visibility=False)
-        if not problem:
+        if fresh:
+            # 后续只等本次导航内容就绪，不补提搜索或混入旧页面源帧。
+            pass
+        elif not problem:
             evidence["page_reused"] = True
             # 上次下拉仍展开时只收起，不重新提交搜索。
             if state.get("suggestion_panel_rect"):
@@ -862,7 +913,7 @@ def _prepare_current_page(page, request: dict, evidence: dict, budget: Budget, p
             finally:
                 if observes:
                     origin_page.remove_listener("popup", on_popup)
-        if not evidence.get("navigation_attempts") and state.get("scroll", {}).get("top", 0) > 1:
+        if state.get("scroll", {}).get("top", 0) > 1 or state.get("document", {}).get("scroll_y", 0) > 1:
             budget.check()
             evidence["scroll_to_top"] = page.evaluate(SCROLL_TOP_JS)
             budget.check()
@@ -891,7 +942,23 @@ def _prepare_current_page(page, request: dict, evidence: dict, budget: Budget, p
             evidence["preparation_problem"] = "keyword_input_not_visible"
             return state
         field = _input_control(page, state)
-        if state.get("keyword") == request["keyword"]:
+        if fresh:
+            field.focus(timeout=budget.check(2000))
+            field.fill("", timeout=budget.check(2000))
+            for _ in range(25):
+                cleared = _snapshot(page, budget, evidence.get("http_status"))
+                if _block(cleared):
+                    return cleared
+                if cleared.get("keyword") == "" and not cleared.get("suggestions"):
+                    break
+                budget.pause(60)
+            else:
+                evidence["preparation_problem"] = "suggestion_reset_not_confirmed"
+                return cleared
+            field.fill(request["keyword"], timeout=budget.check(2000))
+            evidence.update(suggestion_focus_attempts=1, keyword_fill_attempts=2,
+                            keyword_input_completed=True, suggestion_input_action="clear_and_refill")
+        elif state.get("keyword") == request["keyword"]:
             evidence["page_reused"] = True
             if not (state.get("suggestion_panel_associated") and state.get("suggestion_panel_rect")):
                 # 聚焦即可展开的平台不需要坐标点击；仍检查页面阻塞与完整面板。
@@ -916,6 +983,13 @@ def _prepare_current_page(page, request: dict, evidence: dict, budget: Budget, p
             budget.check()
             evidence.update(keyword_input_completed=True, keyword_fill_attempts=1)
     ready = _settled(page, request, budget, evidence.get("http_status"))
+    if ready.get("wait_reason"):
+        evidence["preparation_problem"] = ready["wait_reason"]
+    if request["capture_kind"] == "results" and not _block(ready) and not ready.get("wait_reason"):
+        if (ready.get("scroll", {}).get("at_top") is not True
+                or ready.get("scroll", {}).get("top", 0) > 1
+                or ready.get("document", {}).get("scroll_y", 0) > 1):
+            evidence["preparation_problem"] = "search_not_at_top"
     if request["capture_kind"] == "results" and ready.get("suggestion_panel_rect"):
         evidence["preparation_problem"] = "suggestion_panel_not_dismissed"
     return ready

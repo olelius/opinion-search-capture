@@ -372,8 +372,11 @@ class _Controller:
             while True:
                 if interrupted() or time.monotonic() >= deadline:
                     self._stop()
-                    return _result(request, "cancelled" if interrupted() else "partial",
-                                   "cancel_requested" if interrupted() else "browser_response_timeout")
+                    cancelled = interrupted()
+                    result = _result(request, "cancelled" if cancelled else "partial",
+                                     "cancel_requested" if cancelled else "browser_response_timeout")
+                    result.update(retryable=not cancelled, outcome="cancelled" if cancelled else "timeout")
+                    return result
                 try:
                     line = self.responses.get(timeout=min(.1, max(.001, deadline-time.monotonic())))
                 except queue.Empty:

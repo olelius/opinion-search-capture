@@ -3,6 +3,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import random
+import re
 import tempfile
 import time
 import unittest
@@ -11,7 +12,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from opinion_capture.android import AndroidBlocked, _swipe_forward
+from opinion_capture.android import AdbClient, AndroidBlocked, _swipe_forward
 from opinion_capture.android_results import (
     EvidenceError, RankLedger, bounds, match_visual_frames, render_long, xhs_query_nodes,
 )
@@ -19,6 +20,9 @@ from opinion_capture.android_results import (
 
 class RecordingAdb:
     """只记录手势命令，不调用ADB。"""
+    # 复用生产手势构造，仅以run替身截获最终单条shell命令。
+    drag_hold = AdbClient.drag_hold
+
     def __init__(self):
         self.deadline = time.monotonic() + 10
         self.cancel_file = None
@@ -27,6 +31,7 @@ class RecordingAdb:
 
     def run(self, *command):
         self.commands.append(command)
+        return b"gesture_completed\n"
 
 
 class Scroll80SliceTests(unittest.TestCase):
@@ -77,10 +82,21 @@ class Scroll80SliceTests(unittest.TestCase):
                         self.assertEqual(action["start"][1] - action["end"][1], round(height * .8))
                         self.assertTrue(viewport[1] < action["end"][1] < action["start"][1] < viewport[3])
                         self.assertAlmostEqual(action["expected_overlap_ratio"], .2, delta=1 / height)
+                        self.assertEqual(len(adb.commands), 1)
                         command = adb.commands[0]
-                        self.assertEqual(int(command[4]) - int(command[6]), round(height * .8))
-                        self.assertLessEqual(action["nominal_speed_px_s"], 450)
-                        self.assertEqual(int(command[-1]), action["duration_ms"])
+                        self.assertEqual(command[0], "shell")
+                        events = re.findall(r"motionevent (DOWN|MOVE|UP) (\d+) (\d+)", command[1])
+                        self.assertEqual(events[0], ("DOWN", *map(str, action["start"])))
+                        self.assertEqual(events[-1], ("UP", *map(str, action["end"])))
+                        self.assertEqual(int(events[0][2]) - int(events[-1][2]), round(height * .8))
+                        self.assertEqual(action["gesture"], "adb_single_shell_motionevent_end_hold")
+                        self.assertEqual(action["move_duration_ms"], 400 if cautious else 320)
+                        self.assertEqual(action["end_hold_ms"], 180)
+                        self.assertEqual(action["duration_ms"], 580 if cautious else 500)
+                        self.assertAlmostEqual(action["nominal_speed_px_s"], action["target_px"] * 1000 / action["move_duration_ms"])
+                        self.assertTrue(all(event == ("MOVE", *map(str, action["end"])) for event in events[-4:-1]))
+                        self.assertEqual(command[1].count("sleep 0.060"), 3)
+                        self.assertAlmostEqual(sum(map(float, re.findall(r"sleep ([\d.]+)", command[1]))), action["duration_ms"] / 1000)
 
     def test_boundary_shortens_but_normal_distance_has_no_pixel_cap(self):
         adb = RecordingAdb()

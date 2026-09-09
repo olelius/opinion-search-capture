@@ -161,7 +161,7 @@ SNAPSHOT_JS = "() => {" + DOM_HELPERS_JS + r"""
 
 SCROLL_JS = "step => {" + DOM_HELPERS_JS + r"""
   const previous=host.scrollTop;
-  host.scrollBy({top:Math.max(1,Math.min(step,(docHost?innerHeight:host.clientHeight)*.55)),behavior:'instant'});
+  host.scrollBy({top:Math.max(1,Math.min(step,(docHost?innerHeight:host.clientHeight)*.8)),behavior:'instant'});
   return {before:previous,after:host.scrollTop};
 }"""
 

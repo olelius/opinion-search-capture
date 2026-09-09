@@ -1,6 +1,10 @@
 # APP严格TOP N、原生长图与下拉词开发交接
 
-## 2026-09-09 Android 80%最终交接
+## 当前源码：快速滚动与有限重试
+
+后续已用单通道ADB触控序列替换下述450px/s慢手势，保留80%目标和末端停留；加载等待、从头重试与验证边界见`docs/滚动与重试.md`。尚未发布新EXE，以下实拍属于较早的80%慢手势基线，不作为新速度的实机证据。
+
+## 2026-09-09 较早Android 80%基线交接
 
 - 两APP TOP20成品均已完成；停止本切片设备操作，MuMu实例0保持运行，成功项不重跑。没有操作浏览器、Git、打包或子agent。
 - 仅修改 `src/opinion_capture/android.py`、`android_results.py`、`android_image_evidence.py`、新增 `tests/test_android_scroll80_slice.py` 及本文；config/GUI/WEB/session/runner/PROJECT_PROGRESS由主agent负责。

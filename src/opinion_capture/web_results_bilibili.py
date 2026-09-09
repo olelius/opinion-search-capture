@@ -192,6 +192,33 @@ _TILE_VISIBILITY_JS = r"""({indices, top, bottom, width}) => {
 }"""
 
 
+def _next_scroll_y(scene: dict, limit: float) -> float:
+    """每次前进80%视口，末步只到目标底边，保留重叠且不多滚一屏。"""
+    height = scene["viewport"]["height"]
+    return max(0, min(scene["scroll_y"] + height * .8, limit - height))
+
+
+def _settled_pair(page, budget, read, indices=None) -> tuple[dict, dict]:
+    """保留短间隔稳定对；只等当前可见目标图片，已就绪不再固定静置。"""
+    before = read()
+    for _ in range(100):
+        budget.pause(page, 60)
+        after = read()
+        top, height = after["scroll_y"], after["viewport"]["height"]
+        visible = [item for item in after["items"]
+                   if (indices is None or item["dom_index"] in indices)
+                   and item["rect"]["y"] < top + height
+                   and item["rect"]["y"] + item["rect"]["height"] > top]
+        loaded = after.get("fonts_loaded") and all(item.get("images_loaded") for item in visible)
+        stable = (before["scroll_y"] == top
+                  and layout_fingerprint(before, indices) == layout_fingerprint(after, indices))
+        if loaded and stable:
+            return before, after
+        before = after
+    reason = "content_load_timeout" if not loaded else "page_kept_changing_within_budget"
+    raise PageState("partial", reason, after)
+
+
 def capture_viewport_region(page, scene: dict, crop: dict, targets: list[dict], run: Path,
                             page_index: int, attempt: int, budget, read) -> tuple[dict, list[dict], list[str]]:
     """只截原视口并以原像素组装页顶目标区域，避免 full_page 改变原生滚动条布局。
@@ -210,10 +237,10 @@ def capture_viewport_region(page, scene: dict, crop: dict, targets: list[dict], 
     try:
         for number in range(1, 121):
             budget()
-            y = 0 if not covered else max(0, covered - scene["viewport"]["height"] * .45)
+            height = scene["viewport"]["height"]
+            y = 0 if not covered else max(0, min(covered - height * .2, bottom - height))
             page.evaluate("y => window.scrollTo(0,y)", y)
-            budget.pause(page, 150)
-            before = read()
+            _, before = _settled_pair(page, budget, read, indices)
             scroll = round(before["scroll_y"])
             end = min(bottom, scroll + before["viewport"]["height"])
             if scroll > covered or end <= covered:
@@ -440,6 +467,9 @@ def collect_results(page, request: dict, run: Path, budget, snapshot, classify, 
         if not scene["items"] and not explicit_end(scene):
             stopped_reason = "results_not_loaded"
             break
+        if scene.get("scroll_y", 0) > 1:
+            page.evaluate("window.scrollTo(0,0)")
+            _, scene = _settled_pair(page, budget, read)
         # 从页顶逐屏经过目标区域，既触发懒加载，也核验完整卡的遮挡状态。
         visibility = {}
         previous, stable_rounds = None, 0
@@ -454,13 +484,19 @@ def collect_results(page, request: dict, run: Path, budget, snapshot, classify, 
             signature = layout_fingerprint(scene, {i["dom_index"] for i in target})
             reached = scene["scroll_y"] + scene["viewport"]["height"] >= limit - 2
             stable_rounds = stable_rounds + 1 if signature == previous and reached else 0
-            if stable_rounds >= 3:
+            loaded = scene.get("fonts_loaded") and all(item.get("images_loaded") for item in target)
+            if stable_rounds >= 1 and loaded:
                 break
             previous = signature
             if not reached:
-                page.evaluate("y => window.scrollTo(0,y)", min(scene["scroll_y"] + scene["viewport"]["height"] * .55, limit))
-            pause(250)
-            scene = read()
+                page.evaluate("y => window.scrollTo(0,y)", _next_scroll_y(scene, limit))
+                _, scene = _settled_pair(page, budget, read, {i["dom_index"] for i in target})
+            else:
+                pause(60)
+                scene = read()
+        else:
+            stopped_reason = "results_loading_stalled"
+            break
         fresh, occurrences = rank_items(scene, seen, page_index)
         enough = len(seen) + len(fresh) >= request["top_n"]
         # 每张目标卡对齐至视口中部，补足跨屏边缘和上方固定导航的遮挡验证。
@@ -471,17 +507,13 @@ def collect_results(page, request: dict, run: Path, budget, snapshot, classify, 
                 continue
             y = max(0, item["rect"]["y"] - (scene["viewport"]["height"] - item["rect"]["height"]) / 2)
             page.evaluate("y => window.scrollTo(0,y)", y)
-            pause(180)
-            current = read()
+            _, current = _settled_pair(page, budget, read, {item["dom_index"]})
             match = next((i for i in current["items"] if i["dom_index"] == item["dom_index"]), {})
             if match.get("unobscured") is True and match.get("images_loaded"):
                 visibility[item["dom_index"]] = item_signature(match)
         page.evaluate("window.scrollTo(0,0)")
         page.mouse.move(0, 0)
-        pause(300)
-        before = read()
-        pause(300)
-        settled = read()
+        before, settled = _settled_pair(page, budget, read)
         # 截图前后都读取；变化时最多追加一个版本，原图从不覆盖。
         record = None
         for attempt in range(1, 3):
@@ -497,9 +529,8 @@ def collect_results(page, request: dict, run: Path, budget, snapshot, classify, 
                 page, settled, crop, targets, run, page_index, attempt, budget, read)
             finished = budget.timestamp()
             page.evaluate("window.scrollTo(0,0)")
-            pause(150)
-            after = read()
             indices = {i["dom_index"] for i in targets}
+            _, after = _settled_pair(page, budget, read, indices)
             stable = (layout_fingerprint(before, indices) == layout_fingerprint(settled, indices)
                       == layout_fingerprint(after, indices)
                       and not any("changed" in f for f in frame_failures))
@@ -542,9 +573,7 @@ def collect_results(page, request: dict, run: Path, budget, snapshot, classify, 
             checkpoint(record)
             if stable:
                 break
-            before = after
-            pause(350)
-            settled = read()
+            before, settled = _settled_pair(page, budget, read, indices)
         pages.append(record)
         for item in fresh:
             seen[item["id"]] = item["rank"]

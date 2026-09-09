@@ -4,10 +4,13 @@ import time
 import unittest
 import xml.etree.ElementTree as ET
 
-from opinion_capture.android import AndroidBlocked, _swipe_forward
+from opinion_capture.android import AdbClient, AndroidBlocked, _swipe_forward
 
 
 class RecordingAdb:
+    """仅复用手势编码，run截获命令；不创建真实ADB客户端。"""
+    drag_hold = AdbClient.drag_hold
+
     def __init__(self):
         self.deadline = time.monotonic() + 5
         self.cancel_file = None
@@ -15,6 +18,7 @@ class RecordingAdb:
 
     def run(self, *command):
         self.commands.append(command)
+        return b"gesture_completed\n"
 
 
 class ScrollProgressTests(unittest.TestCase):
@@ -38,6 +42,10 @@ class ScrollProgressTests(unittest.TestCase):
         self.assertEqual(action["start"][0], 810)
         self.assertTrue(210 < action["end"][1] < action["start"][1] < 1721)
         self.assertEqual(len(adb.commands), 1)
+        self.assertEqual(adb.commands[0][0], "shell")
+        self.assertIn(f"motionevent DOWN 810 {action['start'][1]}", adb.commands[0][1])
+        self.assertIn(f"motionevent UP 810 {action['end'][1]}", adb.commands[0][1])
+        self.assertEqual(action["end_hold_ms"], 180)
 
     def test_missing_visible_content_never_dispatches(self):
         adb = RecordingAdb()
